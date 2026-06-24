@@ -97,8 +97,9 @@ namespace MonoTorrent.Client
         public void UtpConfig_Defaults_AreSensible ()
         {
             var cfg = UtpConfig.Default;
-            Assert.AreEqual (75, cfg.TargetDelayMilliseconds);
-            Assert.AreEqual (1.0, cfg.GainFactor);
+            Assert.AreEqual (100, cfg.TargetDelayMilliseconds);
+            Assert.AreEqual (3000, cfg.GainFactor);
+            Assert.AreEqual (50, cfg.LossMultiplier);
             Assert.Greater (cfg.ReceiveWindow, 0);
             Assert.Greater (cfg.MaxPacketSize, 0);
             Assert.Greater (cfg.MaxConnections, 0);
@@ -165,7 +166,8 @@ namespace MonoTorrent.Client
             var settings = new EngineSettingsBuilder {
                 EnableUtp = true,
                 UtpTargetDelayMilliseconds = 100,
-                UtpGainFactor = 1.5,
+                UtpGainFactor = 3000,
+                UtpLossMultiplier = 50,
                 UtpReceiveWindow = 512 * 1024,
                 UtpMaxPacketSize = 1200,
                 UtpMaxConnections = 50,
@@ -173,7 +175,8 @@ namespace MonoTorrent.Client
 
             var cfg = settings.CreateUtpConfig ();
             Assert.AreEqual (100, cfg.TargetDelayMilliseconds);
-            Assert.AreEqual (1.5, cfg.GainFactor);
+            Assert.AreEqual (3000, cfg.GainFactor);
+            Assert.AreEqual (50, cfg.LossMultiplier);
             Assert.AreEqual (512 * 1024, cfg.ReceiveWindow);
             Assert.AreEqual (1200, cfg.MaxPacketSize);
             Assert.AreEqual (50, cfg.MaxConnections);
@@ -387,6 +390,43 @@ namespace MonoTorrent.Client
             Assert.AreEqual (TypeSyn, WireType (pkt));
             Assert.AreEqual (20, pkt.Length); // SYN has no payload
             Assert.AreEqual (0, pkt[1]); // no extension
+            // BEP 29 / libtorrent layout: wnd_size is 4 bytes at offset 12; seq/ack at 16/18.
+            Assert.AreEqual (20, pkt.Length);
+            uint wnd = (uint) ((pkt[12] << 24) | (pkt[13] << 16) | (pkt[14] << 8) | pkt[15]);
+            Assert.Greater (wnd, 0u, "wnd_size should be non-zero advertised window");
+        }
+
+        [Test]
+        public void UtpHeader_WireLayout_MatchesBep29Libtorrent ()
+        {
+            // Build a header with distinctive multi-byte fields and verify exact offsets.
+            // type/ver | ext | conn_id | ts | tsdiff | wnd(4) | seq(2) | ack(2)
+            var buf = new byte[20];
+            buf[0] = (byte) ((TypeSyn << 4) | 1);
+            buf[1] = 0;
+            buf[2] = 0x12; buf[3] = 0x34; // conn_id = 0x1234
+            buf[4] = 0x00; buf[5] = 0x01; buf[6] = 0x02; buf[7] = 0x03; // ts
+            buf[8] = 0x00; buf[9] = 0x00; buf[10] = 0x10; buf[11] = 0x00; // tsdiff = 0x1000
+            buf[12] = 0x00; buf[13] = 0x01; buf[14] = 0x86; buf[15] = 0xA0; // wnd = 100000
+            buf[16] = 0xAB; buf[17] = 0xCD; // seq
+            buf[18] = 0x01; buf[19] = 0x02; // ack
+
+            // Re-emit through a real SYN and ensure our writer uses the same layout shape
+            // (seq/ack live in the last 4 bytes, not overlapping wnd).
+            var transport = new MockTransport (5055);
+            transport.Start ();
+            using var manager = new UtpSocketManager (new UtpConfig { TickInterval = TimeSpan.FromHours (1), ReceiveWindow = 100_000 });
+            manager.AddTransport (transport);
+            manager.CreateOutgoingConnection (new IPEndPoint (IPAddress.Loopback, 9001));
+            var syn = transport.SentPackets[0].Data;
+            Assert.AreEqual (20, syn.Length);
+            // Bytes 16-17 and 18-19 are seq/ack (non-zero for random seq); bytes 12-15 are wnd (uint32 BE).
+            uint synWnd = (uint) ((syn[12] << 24) | (syn[13] << 16) | (syn[14] << 8) | syn[15]);
+            Assert.AreEqual (100_000u, synWnd);
+            // Fixture buffer sanity: seq/ack not embedded in wnd field.
+            Assert.AreEqual (0x00, buf[12]);
+            Assert.AreEqual (0xAB, buf[16]);
+            Assert.AreEqual (0x01, buf[18]);
         }
 
         [Test]

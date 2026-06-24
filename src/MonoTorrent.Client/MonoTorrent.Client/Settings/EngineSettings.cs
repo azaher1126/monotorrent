@@ -171,14 +171,19 @@ namespace MonoTorrent.Client
 
         /// <summary>
         /// LEDBAT target one-way delay in milliseconds. Lower values yield more aggressively to other traffic.
-        /// libtorrent uses 75ms. Only applies when <see cref="EnableUtp"/> is true. Defaults to 75.
+        /// Matches libtorrent <c>utp_target_delay</c> (default 100). Only applies when <see cref="EnableUtp"/> is true.
         /// </summary>
-        public int UtpTargetDelayMilliseconds { get; } = 75;
+        public int UtpTargetDelayMilliseconds { get; } = 100;
 
         /// <summary>
-        /// LEDBAT gain factor applied to off-target cwnd adjustments. Defaults to 1.0.
+        /// LEDBAT gain factor: max bytes cwnd may grow per RTT when below target (libtorrent <c>utp_gain_factor</c>, default 3000).
         /// </summary>
-        public double UtpGainFactor { get; } = 1.0;
+        public int UtpGainFactor { get; } = 3000;
+
+        /// <summary>
+        /// Percentage multiplier applied to cwnd on packet loss (libtorrent <c>utp_loss_multiplier</c>, default 50).
+        /// </summary>
+        public int UtpLossMultiplier { get; } = 50;
 
         /// <summary>
         /// Advertised uTP receive window in bytes. Defaults to 1 MiB.
@@ -380,7 +385,8 @@ namespace MonoTorrent.Client
             int maximumOpenFiles, int maximumUploadRate, IDictionary<string, IPEndPoint> reportedListenEndPoints, bool usePartialFiles,
             TimeSpan webSeedConnectionTimeout, TimeSpan webSeedDelay, int webSeedSpeedTrigger, TimeSpan staleRequestTimeout,
             string httpStreamingPrefix, IList<TimeSpan> connectionRetryDelays,
-            bool enableUtp = true, int utpTargetDelayMilliseconds = 75, double utpGainFactor = 1.0, int utpReceiveWindow = 1024 * 1024,
+            bool enableUtp = true, int utpTargetDelayMilliseconds = 100, int utpGainFactor = 3000, int utpLossMultiplier = 50,
+            int utpReceiveWindow = 1024 * 1024,
             int utpMaxPacketSize = 1500, bool utpAllowDynamicMtu = true, int utpMinTimeoutMilliseconds = 500,
             int utpInitialTimeoutMilliseconds = 1000, int utpSynResends = 2, int utpFinResends = 2, int utpNumResends = 3,
             int utpConnectTimeoutMilliseconds = 30_000, TimeSpan? utpTickInterval = null, int utpMaxConnections = 200)
@@ -422,6 +428,7 @@ namespace MonoTorrent.Client
             EnableUtp = enableUtp;
             UtpTargetDelayMilliseconds = utpTargetDelayMilliseconds;
             UtpGainFactor = utpGainFactor;
+            UtpLossMultiplier = utpLossMultiplier;
             UtpReceiveWindow = utpReceiveWindow;
             UtpMaxPacketSize = utpMaxPacketSize;
             UtpAllowDynamicMtu = utpAllowDynamicMtu;
@@ -465,6 +472,7 @@ namespace MonoTorrent.Client
             => new MonoTorrent.Connections.Peer.Utp.UtpConfig {
                 TargetDelayMilliseconds = UtpTargetDelayMilliseconds,
                 GainFactor = UtpGainFactor,
+                LossMultiplier = UtpLossMultiplier,
                 ReceiveWindow = UtpReceiveWindow,
                 MaxPacketSize = UtpMaxPacketSize,
                 AllowDynamicMtu = UtpAllowDynamicMtu,
@@ -532,6 +540,7 @@ namespace MonoTorrent.Client
                    && EnableUtp == other.EnableUtp
                    && UtpTargetDelayMilliseconds == other.UtpTargetDelayMilliseconds
                    && UtpGainFactor == other.UtpGainFactor
+                   && UtpLossMultiplier == other.UtpLossMultiplier
                    && UtpReceiveWindow == other.UtpReceiveWindow
                    && UtpMaxPacketSize == other.UtpMaxPacketSize
                    && UtpAllowDynamicMtu == other.UtpAllowDynamicMtu

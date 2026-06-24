@@ -1124,6 +1124,7 @@ namespace MonoTorrent.Client
                 oldSettings.EnableUtp != newSettings.EnableUtp ||
                 oldSettings.UtpTargetDelayMilliseconds != newSettings.UtpTargetDelayMilliseconds ||
                 oldSettings.UtpGainFactor != newSettings.UtpGainFactor ||
+                oldSettings.UtpLossMultiplier != newSettings.UtpLossMultiplier ||
                 oldSettings.UtpReceiveWindow != newSettings.UtpReceiveWindow ||
                 oldSettings.UtpMaxPacketSize != newSettings.UtpMaxPacketSize ||
                 oldSettings.UtpAllowDynamicMtu != newSettings.UtpAllowDynamicMtu ||

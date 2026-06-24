@@ -47,43 +47,44 @@ namespace MonoTorrent.Connections.Peer.Utp
     internal static class UtpConstants
     {
         public const byte Version = 1;
-        public const int HeaderSize = 20; // 1+1+2 +4+4 +2+2+2
+        // BEP 29 / libtorrent: type(1)+ext(1)+conn_id(2)+ts(4)+tsdiff(4)+wnd(4)+seq(2)+ack(2) = 20
+        public const int HeaderSize = 20;
         public const int MaxPacketSize = 64 * 1024; // reasonable upper bound before MTU discovery
         public const ushort AckMask = 0xFFFF;
 
-        // Extension field values
+        // Extension field values (libtorrent skips deprecated extension id 2)
         public const byte NoExtension = 0;
         public const byte SelectiveAckExtension = 1;
+        public const byte CloseReasonExtension = 3;
     }
 
     /// <summary>
-    /// Represents the fixed 20-byte uTP header (BEP 29). Provides helpers to read/write from spans.
-    /// This struct is intentionally blittable-ish for fast handling; we parse manually for clarity and endian safety.
+    /// Represents the fixed 20-byte uTP header (BEP 29). Wire layout matches libtorrent's <c>utp_header</c>.
     /// </summary>
     [StructLayout (LayoutKind.Sequential, Pack = 1)]
     internal readonly struct UtpHeader
     {
-        // Wire layout (big endian for multi-byte):
+        // Wire layout (big endian for multi-byte) — BEP 29 / libtorrent aux_/utp_stream.hpp:
         // byte 0: type (high 4) | version (low 4)
         // byte 1: extension
         // bytes 2-3: connection_id (big endian)
         // bytes 4-7: timestamp_microseconds (big endian)
         // bytes 8-11: timestamp_difference_microseconds (big endian)
-        // bytes 12-13: wnd_size (big endian)
-        // bytes 14-15: seq_nr (big endian)
-        // bytes 16-19: ack_nr (big endian)
+        // bytes 12-15: wnd_size (big endian, uint32)
+        // bytes 16-17: seq_nr (big endian)
+        // bytes 18-19: ack_nr (big endian)
 
         public readonly byte TypeVersion;
         public readonly byte Extension;
         public readonly ushort ConnectionId;
         public readonly uint TimestampMicroseconds;
         public readonly uint TimestampDifferenceMicroseconds;
-        public readonly ushort WindowSize;
+        public readonly uint WindowSize;
         public readonly ushort SeqNr;
         public readonly ushort AckNr;
 
         public UtpHeader (byte typeVersion, byte extension, ushort connectionId,
-                          uint tsMicro, uint tsDiffMicro, ushort wndSize,
+                          uint tsMicro, uint tsDiffMicro, uint wndSize,
                           ushort seqNr, ushort ackNr)
         {
             TypeVersion = typeVersion;
@@ -110,9 +111,9 @@ namespace MonoTorrent.Connections.Peer.Utp
             ushort connId = BinaryPrimitives.ReadUInt16BigEndian (buffer.Slice (2, 2));
             uint ts = BinaryPrimitives.ReadUInt32BigEndian (buffer.Slice (4, 4));
             uint tsdiff = BinaryPrimitives.ReadUInt32BigEndian (buffer.Slice (8, 4));
-            ushort wnd = BinaryPrimitives.ReadUInt16BigEndian (buffer.Slice (12, 2));
-            ushort seq = BinaryPrimitives.ReadUInt16BigEndian (buffer.Slice (14, 2));
-            ushort ack = BinaryPrimitives.ReadUInt16BigEndian (buffer.Slice (16, 2));
+            uint wnd = BinaryPrimitives.ReadUInt32BigEndian (buffer.Slice (12, 4));
+            ushort seq = BinaryPrimitives.ReadUInt16BigEndian (buffer.Slice (16, 2));
+            ushort ack = BinaryPrimitives.ReadUInt16BigEndian (buffer.Slice (18, 2));
 
             header = new UtpHeader (typeVer, ext, connId, ts, tsdiff, wnd, seq, ack);
             return true;
@@ -128,9 +129,9 @@ namespace MonoTorrent.Connections.Peer.Utp
             BinaryPrimitives.WriteUInt16BigEndian (destination.Slice (2, 2), ConnectionId);
             BinaryPrimitives.WriteUInt32BigEndian (destination.Slice (4, 4), TimestampMicroseconds);
             BinaryPrimitives.WriteUInt32BigEndian (destination.Slice (8, 4), TimestampDifferenceMicroseconds);
-            BinaryPrimitives.WriteUInt16BigEndian (destination.Slice (12, 2), WindowSize);
-            BinaryPrimitives.WriteUInt16BigEndian (destination.Slice (14, 2), SeqNr);
-            BinaryPrimitives.WriteUInt16BigEndian (destination.Slice (16, 2), AckNr);
+            BinaryPrimitives.WriteUInt32BigEndian (destination.Slice (12, 4), WindowSize);
+            BinaryPrimitives.WriteUInt16BigEndian (destination.Slice (16, 2), SeqNr);
+            BinaryPrimitives.WriteUInt16BigEndian (destination.Slice (18, 2), AckNr);
         }
 
         public override string ToString ()

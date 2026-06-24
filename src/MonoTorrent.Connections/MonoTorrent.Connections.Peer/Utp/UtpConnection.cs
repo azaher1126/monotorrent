@@ -104,8 +104,11 @@ namespace MonoTorrent.Connections.Peer.Utp
         readonly UtpSocketManager _manager;
         readonly IPEndPoint _remoteEndPoint;
         readonly bool _isIncoming;
-        int _targetDelayMs;
+        /// <summary>LEDBAT target delay in microseconds (libtorrent stores ms * 1000).</summary>
+        int _targetDelayUs;
         readonly UtpConfig _config;
+        readonly int _gainFactor;
+        readonly int _lossMultiplier;
         // Serializes protocol + stream access (manager tick, UDP receive, and IPeerConnection I/O may race).
         readonly object _sync = new object ();
 
@@ -187,7 +190,11 @@ namespace MonoTorrent.Connections.Peer.Utp
             RecvId = recvId;
             SendId = sendId;
             _isIncoming = isIncoming;
-            _targetDelayMs = Math.Max(1, targetDelayMs > 0 ? targetDelayMs : _config.TargetDelayMilliseconds);
+            // libtorrent: target_delay() returns settings_pack::utp_target_delay (ms) * 1000 microseconds.
+            int targetMs = Math.Max (1, targetDelayMs > 0 ? targetDelayMs : _config.TargetDelayMilliseconds);
+            _targetDelayUs = targetMs * 1000;
+            _gainFactor = Math.Max (1, _config.GainFactor > 0 ? _config.GainFactor : 3000);
+            _lossMultiplier = Math.Clamp (_config.LossMultiplier > 0 ? _config.LossMultiplier : 50, 1, 100);
 
             _state = UtpState.None;
             _seqNr = (ushort)_rng.Next(0, ushort.MaxValue);
@@ -257,7 +264,7 @@ namespace MonoTorrent.Connections.Peer.Utp
                 pkt.SendTime = DateTimeOffset.UtcNow;
                 pkt.NumTransmissions = 1;
                 pkt.SeqNr = _seqNr;
-                var h = new UtpHeader((byte)((byte)UtpPacketType.ST_SYN << 4 | UtpConstants.Version), UtpConstants.NoExtension, SendId, CurrentMicroTimestamp(), _replyMicro, (ushort)Math.Min(ushort.MaxValue, 64 * 1024), _seqNr, 0);
+                var h = new UtpHeader((byte)((byte)UtpPacketType.ST_SYN << 4 | UtpConstants.Version), UtpConstants.NoExtension, SendId, CurrentMicroTimestamp(), _replyMicro, LocalAdvertisedWindow(), _seqNr, 0);
                 h.WriteTo(pkt.Data);
                 _outbuf[_seqNr] = pkt;
                 _seqNr = (ushort)((_seqNr + 1) & UtpConstants.AckMask);
@@ -403,9 +410,9 @@ namespace MonoTorrent.Connections.Peer.Utp
                     if (rr < minR) minR = rr;
                     ackB += ex;
                 }
-                else if (e == 2) // utp_close_reason (libtorrent interop)
+                else if (e == UtpConstants.CloseReasonExtension)
                 {
-                    // consume; could parse reason code from buf.Slice(p, ln) and set error
+                    // libtorrent utp_close_reason (ext id 3): optional diagnostic; accept and ignore body.
                 }
                 p += ln;
                 e = nx;
@@ -542,7 +549,8 @@ namespace MonoTorrent.Connections.Peer.Utp
             if ((n - _nextLoss).TotalMilliseconds < 100) return;
             _nextLoss = n + TimeSpan.FromMilliseconds(100);
             if (_slowStart) { _ssthres = (int)(_cwnd >> 16) / 2; _slowStart = false; }
-            _cwnd = Math.Max(_cwnd / 2, (long)_mtu << 16);
+            // libtorrent: m_cwnd = max(m_cwnd * loss_multiplier / 100, mtu << 16)
+            _cwnd = Math.Max (_cwnd * _lossMultiplier / 100, (long) _mtu << 16);
         }
 
         private void ResendPacket(UtpPacket p, bool f)
@@ -557,27 +565,45 @@ namespace MonoTorrent.Connections.Peer.Utp
                 _bytesInFlight += p.PayloadSize;
         }
 
+        /// <summary>
+        /// LEDBAT congestion control aligned with libtorrent <c>utp_socket_impl::do_ledbat</c>.
+        /// <paramref name="dl"/> and target delay are both in microseconds.
+        /// </summary>
         private void DoLedbat(int ab, int dl, int inf)
         {
             if (inf <= 0 || ab <= 0) return;
-            int tg = Math.Max(1, _targetDelayMs);
+            int tg = Math.Max (1, _targetDelayUs);
             bool sat = (_bytesInFlight + ab + _mtu) > (_cwnd >> 16);
-            long wf = ((long)ab << 16) / inf;
-            long df = ((long)(tg - dl) << 16) / tg;
-            // Gain factor from config (another-bep29-impl) scales off-target LEDBAT adjustments.
-            int gainQ8 = Math.Clamp ((int) ((_config.GainFactor <= 0 ? 1.0 : _config.GainFactor) * 256), 1, 16 * 256);
-            long gn;
-            if (dl >= tg && _slowStart) { _ssthres = (int)(_cwnd >> 16) / 2; _slowStart = false; }
-            long ln = ((wf * df * gainQ8) >> 8) >> 16;
-            if (sat)
-            {
-                long ex = (long)ab << 16;
-                if (_slowStart && _ssthres != 0 && ((_cwnd + ex) >> 16) > _ssthres) { _slowStart = false; gn = ln; }
-                else gn = _slowStart ? Math.Max(ex, ln) : ln;
+            // Fixed-point 16.16 factors (same as libtorrent).
+            long wf = ((long) ab << 16) / inf;
+            long df = ((long) (tg - dl) << 16) / tg;
+            if (dl >= tg && _slowStart) {
+                _ssthres = (int) (_cwnd >> 16) / 2;
+                _slowStart = false;
             }
-            else gn = 0;
+            // linear_gain = ((window_factor * delay_factor) >> 16) * gain_factor
+            long ln = ((wf * df) >> 16) * _gainFactor;
+            long gn;
+            if (sat) {
+                long ex = (long) ab << 16;
+                if (_slowStart && _ssthres != 0 && ((_cwnd + ex) >> 16) > _ssthres) {
+                    _slowStart = false;
+                    gn = ln;
+                } else
+                    gn = _slowStart ? Math.Max (ex, ln) : ln;
+            } else
+                gn = 0;
             if (gn > long.MaxValue - _cwnd) gn = long.MaxValue - _cwnd - 1;
-            _cwnd = ((_cwnd + gn) >> 16 < _mtu) ? (long)_mtu << 16 : _cwnd + gn;
+            // Floor cwnd at 1*MSS (rfc6817 / libtorrent; stricter than BEP 29's zero floor).
+            _cwnd = ((_cwnd + gn) >> 16 < _mtu) ? (long) _mtu << 16 : _cwnd + gn;
+        }
+
+        /// <summary>Advertised receive window for outgoing headers (full 32-bit wnd_size per BEP 29).</summary>
+        uint LocalAdvertisedWindow ()
+        {
+            int rw = _config.ReceiveWindow > 0 ? _config.ReceiveWindow : 1024 * 1024;
+            int avail = Math.Max (1500, rw - _receiveBufferSize);
+            return (uint) Math.Min (int.MaxValue, avail);
         }
 
         internal void SendData(ReadOnlyMemory<byte> d)
@@ -693,7 +719,7 @@ namespace MonoTorrent.Connections.Peer.Utp
                 pk.NumTransmissions = 1;
                 pk.SeqNr = _seqNr;
                 pk.MtuProbe = pad > 0;
-                var h = new UtpHeader((byte)((byte)UtpPacketType.ST_DATA << 4 | UtpConstants.Version), UtpConstants.NoExtension, SendId, CurrentMicroTimestamp(), _replyMicro, (ushort)Math.Min(0xFFFF, _advWnd), _seqNr, _ackNr);
+                var h = new UtpHeader((byte)((byte)UtpPacketType.ST_DATA << 4 | UtpConstants.Version), UtpConstants.NoExtension, SendId, CurrentMicroTimestamp(), _replyMicro, LocalAdvertisedWindow(), _seqNr, _ackNr);
                 h.WriteTo(pk.Data);
                 ch.Span.CopyTo(pk.Data.AsSpan(UtpConstants.HeaderSize));
                 // Zero-fill MTU pad; peer must not treat pad as app data unless they implement the same pad convention.
@@ -774,7 +800,7 @@ namespace MonoTorrent.Connections.Peer.Utp
             int extra = hasSack ? 2 + sackBytes : 0;
             var pkt = new byte[UtpConstants.HeaderSize + extra];
             byte ext = hasSack ? UtpConstants.SelectiveAckExtension : UtpConstants.NoExtension;
-            var h = new UtpHeader((byte)((byte)UtpPacketType.ST_STATE << 4 | UtpConstants.Version), ext, SendId, CurrentMicroTimestamp(), _replyMicro, (ushort)Math.Min(0xFFFF, Math.Max(1500, 64 * 1024 - _receiveBufferSize)), _seqNr, _ackNr);
+            var h = new UtpHeader((byte)((byte)UtpPacketType.ST_STATE << 4 | UtpConstants.Version), ext, SendId, CurrentMicroTimestamp(), _replyMicro, LocalAdvertisedWindow(), _seqNr, _ackNr);
             int off = 0;
             h.WriteTo(pkt.AsSpan(off, UtpConstants.HeaderSize));
             off += UtpConstants.HeaderSize;
