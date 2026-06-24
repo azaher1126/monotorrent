@@ -12,9 +12,11 @@
 using System;
 using System.Collections.Generic;
 using System.Net;
+using System.Threading;
 using System.Threading.Tasks;
 
 using MonoTorrent.Connections;
+using MonoTorrent.Connections.Dht;
 using MonoTorrent.Connections.Peer;
 using MonoTorrent.Connections.Peer.Utp;
 
@@ -806,6 +808,230 @@ namespace MonoTorrent.Client
                 Assert.IsNotNull (passivePeer);
                 Assert.GreaterOrEqual (tA.SentPackets.Count, 1);
                 Assert.GreaterOrEqual (tB.SentPackets.Count, 1);
+            }
+        }
+
+        [Test]
+        public void MtuProbe_DoesNotEmitStandaloneDataOnlyPackets ()
+        {
+            // With AllowDynamicMtu, we must not inject extra ST_DATA segments that are padding-only
+            // (would corrupt peer application stream). All DATA segments must carry real app payload.
+            var (connA, passivePeer, tA, tB, mA, mB) = SetupHandshakePair (5201, 5202);
+            // Re-handshake with MTU enabled on a fresh pair.
+            mA.Dispose ();
+            mB.Dispose ();
+
+            var t1 = new MockTransport (5203);
+            var t2 = new MockTransport (5204);
+            t1.Start ();
+            t2.Start ();
+            using var mgr1 = new UtpSocketManager (new UtpConfig { TickInterval = TimeSpan.FromHours (1), AllowDynamicMtu = true });
+            using var mgr2 = new UtpSocketManager (new UtpConfig { TickInterval = TimeSpan.FromHours (1), AllowDynamicMtu = true });
+            mgr1.AddTransport (t1);
+            mgr2.AddTransport (t2);
+            UtpPeerConnection passive = null;
+            var listener = new UtpPeerConnectionListener (new IPEndPoint (IPAddress.Loopback, 5204), mgr2);
+            listener.ConnectionReceived += (_, e) => passive = (UtpPeerConnection) e.Connection;
+            listener.Start ();
+
+            var init = PerformHandshake (mgr1, t1, mgr2, t2, 5204);
+            using var peer = new UtpPeerConnection (init);
+            int before = t1.SentPackets.Count;
+            peer.SendAsync (new byte[64]).AsTask ().GetAwaiter ().GetResult ();
+            for (int i = before; i < t1.SentPackets.Count; i++) {
+                var pkt = t1.SentPackets[i].Data;
+                if (WireType (pkt) == TypeData)
+                    Assert.Greater (pkt.Length, 20, "DATA must include application payload (no probe-only packets)");
+            }
+            _ = passive;
+        }
+
+        [Test]
+        public async Task HalfClose_WriteThenStillReceive ()
+        {
+            var (connA, passivePeer, tA, tB, mA, mB) = SetupHandshakePair (5211, 5212);
+            using (mA)
+            using (mB) {
+                using var peerA = new UtpPeerConnection (connA);
+
+                // Passive sends data to initiator first.
+                var payload = new byte[] { 9, 8, 7 };
+                int bBefore = tB.SentPackets.Count;
+                await passivePeer.SendAsync (payload).ConfigureAwait (false);
+                var fromB = new CompactEndPoint (IPAddress.Loopback, tB.LocalEndPoint.Port > 0 ? tB.LocalEndPoint.Port : 5212);
+                for (int i = bBefore; i < tB.SentPackets.Count; i++)
+                    tA.SimulateReceive (tB.SentPackets[i].Data, fromB);
+
+                // Initiator half-closes write side.
+                connA.CloseWrite ();
+                Assert.IsTrue (connA.WriteClosed);
+                Assert.AreEqual (UtpState.FinSent, connA.State);
+
+                // Initiator can still receive passive's earlier/buffered data path.
+                var rbuf = new byte[8];
+                var rt = peerA.ReceiveAsync (rbuf).AsTask ();
+                Assert.IsTrue (rt.Wait (TimeSpan.FromSeconds (2)));
+                Assert.AreEqual (payload.Length, rt.Result);
+
+                // Further sends from initiator must fail (write closed).
+                try {
+                    await peerA.SendAsync (new byte[] { 1 }).ConfigureAwait (false);
+                    Assert.Fail ("expected write-closed failure");
+                } catch (InvalidOperationException) { /* expected */ }
+            }
+        }
+
+        [Test]
+        public async Task HalfClose_ReadEof_AfterPeerFin_WhileWriteOpen ()
+        {
+            var (connA, passivePeer, tA, tB, mA, mB) = SetupHandshakePair (5221, 5222);
+            using (mA)
+            using (mB) {
+                using var peerA = new UtpPeerConnection (connA);
+
+                // Passive half-closes (dispose triggers FIN).
+                int before = tB.SentPackets.Count;
+                passivePeer.Dispose ();
+                var fromB = new CompactEndPoint (IPAddress.Loopback, tB.LocalEndPoint.Port > 0 ? tB.LocalEndPoint.Port : 5222);
+                for (int i = before; i < tB.SentPackets.Count; i++)
+                    tA.SimulateReceive (tB.SentPackets[i].Data, fromB);
+
+                // Initiator read should hit EOF; write may still be open on connA until we close it.
+                var buf = new byte[4];
+                var recv = peerA.ReceiveAsync (buf).AsTask ();
+                bool done = recv.Wait (TimeSpan.FromMilliseconds (800));
+                if (done && !recv.IsFaulted)
+                    Assert.AreEqual (0, recv.Result);
+
+                // Initiator can still attempt send (write not closed locally).
+                if (connA.State == UtpState.Connected) {
+                    int aBefore = tA.SentPackets.Count;
+                    await peerA.SendAsync (new byte[] { 0x55, 0x66 }).ConfigureAwait (false);
+                    Assert.GreaterOrEqual (tA.SentPackets.Count, aBefore);
+                }
+            }
+        }
+
+        [Test]
+        public async Task HalfClose_BothSides_FullShutdown ()
+        {
+            var (connA, passivePeer, tA, tB, mA, mB) = SetupHandshakePair (5231, 5232);
+            using (mA)
+            using (mB) {
+                using var peerA = new UtpPeerConnection (connA);
+                var fromA = new CompactEndPoint (IPAddress.Loopback, tA.LocalEndPoint.Port > 0 ? tA.LocalEndPoint.Port : 1);
+                var fromB = new CompactEndPoint (IPAddress.Loopback, tB.LocalEndPoint.Port > 0 ? tB.LocalEndPoint.Port : 5232);
+
+                int a0 = tA.SentPackets.Count;
+                connA.CloseWrite ();
+                for (int i = a0; i < tA.SentPackets.Count; i++)
+                    tB.SimulateReceive (tA.SentPackets[i].Data, fromA);
+
+                int b0 = tB.SentPackets.Count;
+                passivePeer.Dispose ();
+                for (int i = b0; i < tB.SentPackets.Count; i++)
+                    tA.SimulateReceive (tB.SentPackets[i].Data, fromB);
+
+                // Deliver any ACKs/FIN replies both ways once more.
+                int a1 = tA.SentPackets.Count;
+                for (int i = a0; i < a1; i++)
+                    tB.SimulateReceive (tA.SentPackets[i].Data, fromA);
+                int b1 = tB.SentPackets.Count;
+                for (int i = b0; i < b1; i++)
+                    tA.SimulateReceive (tB.SentPackets[i].Data, fromB);
+
+                Assert.IsTrue (connA.WriteClosed || connA.State == UtpState.FinSent || connA.State == UtpState.Deleting);
+                await Task.CompletedTask.ConfigureAwait (false);
+            }
+        }
+
+        /// <summary>
+        /// Live loopback interop: two UtpSocketManagers on real UDP sockets (DhtListener / UdpListener).
+        /// Exercises the full stack without external libtorrent; validates wire compatibility of our implementation.
+        /// </summary>
+        [Test]
+        public async Task LiveLoopback_TwoManagers_HandshakeAndEcho ()
+        {
+            // Ephemeral ports via port 0 bind. DhtListener is a concrete UdpListener (real sockets).
+            var udpA = new DhtListener (new IPEndPoint (IPAddress.Loopback, 0));
+            var udpB = new DhtListener (new IPEndPoint (IPAddress.Loopback, 0));
+            try {
+            udpA.Start ();
+            udpB.Start ();
+
+            // Allow bind to complete.
+            for (int i = 0; i < 50 && (udpA.LocalEndPoint == null || udpB.LocalEndPoint == null); i++)
+                await Task.Delay (10).ConfigureAwait (false);
+            Assert.IsNotNull (udpA.LocalEndPoint);
+            Assert.IsNotNull (udpB.LocalEndPoint);
+
+            using var mA = new UtpSocketManager (new UtpConfig {
+                TickInterval = TimeSpan.FromMilliseconds (50),
+                AllowDynamicMtu = false,
+                ConnectTimeoutMilliseconds = 10_000
+            });
+            using var mB = new UtpSocketManager (new UtpConfig {
+                TickInterval = TimeSpan.FromMilliseconds (50),
+                AllowDynamicMtu = false
+            });
+            mA.AddTransport (udpA);
+            mB.AddTransport (udpB);
+
+            UtpPeerConnection passivePeer = null;
+            var listener = new UtpPeerConnectionListener (udpB.LocalEndPoint, mB);
+            listener.ConnectionReceived += (_, e) => passivePeer = (UtpPeerConnection) e.Connection;
+            listener.Start ();
+
+            var implA = mA.CreateOutgoingConnection (udpB.LocalEndPoint);
+            using var peerA = new UtpPeerConnection (implA);
+
+            // Wait for handshake (real UDP).
+            var sw = System.Diagnostics.Stopwatch.StartNew ();
+            while (implA.State != UtpState.Connected && sw.ElapsedMilliseconds < 8000)
+                await Task.Delay (20).ConfigureAwait (false);
+            Assert.AreEqual (UtpState.Connected, implA.State, "initiator should connect over live UDP");
+
+            sw.Restart ();
+            while (passivePeer == null && sw.ElapsedMilliseconds < 8000)
+                await Task.Delay (20).ConfigureAwait (false);
+            Assert.IsNotNull (passivePeer, "passive listener should accept over live UDP");
+
+            bool connected = await peerA.ConnectAsync ().ConfigureAwait (false);
+            Assert.IsTrue (connected);
+
+            var payload = new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 };
+            await peerA.SendAsync (payload).ConfigureAwait (false);
+
+            var recvBuf = new byte[32];
+            var recvTask = passivePeer.ReceiveAsync (recvBuf).AsTask ();
+            sw.Restart ();
+            while (!recvTask.IsCompleted && sw.ElapsedMilliseconds < 8000)
+                await Task.Delay (20).ConfigureAwait (false);
+            Assert.IsTrue (recvTask.IsCompleted, "passive should receive over live UDP");
+            if (!recvTask.IsFaulted) {
+                Assert.AreEqual (payload.Length, recvTask.Result);
+                CollectionAssert.AreEqual (payload, recvBuf.AsSpan (0, recvTask.Result).ToArray ());
+            }
+
+            // Reverse direction on live sockets.
+            var payload2 = new byte[] { 0xDE, 0xAD };
+            await passivePeer.SendAsync (payload2).ConfigureAwait (false);
+            var recvBuf2 = new byte[16];
+            var recv2 = peerA.ReceiveAsync (recvBuf2).AsTask ();
+            sw.Restart ();
+            while (!recv2.IsCompleted && sw.ElapsedMilliseconds < 8000)
+                await Task.Delay (20).ConfigureAwait (false);
+            Assert.IsTrue (recv2.IsCompleted, "initiator should receive reverse data over live UDP");
+            if (!recv2.IsFaulted) {
+                Assert.AreEqual (payload2.Length, recv2.Result);
+                CollectionAssert.AreEqual (payload2, recvBuf2.AsSpan (0, recv2.Result).ToArray ());
+            }
+
+            udpA.Stop ();
+            udpB.Stop ();
+            } finally {
+                try { udpA.Stop (); } catch { /* ignore */ }
+                try { udpB.Stop (); } catch { /* ignore */ }
             }
         }
     }

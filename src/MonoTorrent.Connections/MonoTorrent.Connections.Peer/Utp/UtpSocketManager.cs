@@ -463,6 +463,7 @@ namespace MonoTorrent.Connections.Peer.Utp
                 }
             }
             p.HeaderSize = 0;
+            p.AppPayloadSize = 0;
             p.NumTransmissions = 0;
             p.MtuProbe = false;
             p.NeedResend = false;

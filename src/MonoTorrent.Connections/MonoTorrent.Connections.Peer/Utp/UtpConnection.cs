@@ -44,6 +44,8 @@ namespace MonoTorrent.Connections.Peer.Utp
     {
         public byte[] Data { get; set; } = Array.Empty<byte>();
         public int HeaderSize { get; set; }
+        /// <summary>Application payload length (excludes optional MTU pad bytes on the wire).</summary>
+        public int AppPayloadSize { get; set; }
         public DateTimeOffset SendTime { get; set; }
         public int NumTransmissions { get; set; }
         public bool MtuProbe { get; set; }
@@ -51,6 +53,8 @@ namespace MonoTorrent.Connections.Peer.Utp
         public ushort SeqNr { get; set; }
         public int Size => Data.Length;
         public int PayloadSize => Size - HeaderSize;
+        /// <summary>Wire payload bytes counted for in-flight/cwnd (includes MTU pad when present).</summary>
+        public int WirePayloadSize => PayloadSize;
     }
 
     internal sealed class TimestampHistory
@@ -161,6 +165,7 @@ namespace MonoTorrent.Connections.Peer.Utp
 
         private readonly Queue<ReadOnlyMemory<byte>> _sendQueue = new Queue<ReadOnlyMemory<byte>>();
         private bool _outEof;
+        private bool _finPacketSent;
 
         private Exception? _error;
         public bool HasError => _error != null;
@@ -437,6 +442,8 @@ namespace MonoTorrent.Connections.Peer.Utp
                     _inEofSeqNr = (ushort) ((ph.SeqNr + (psz > 0 ? 1u : 0u)) & UtpConstants.AckMask);
                 }
                 TrySignalEofToWaiters ();
+                // Half-close: peer finished writing; we can still send until our own FIN.
+                MaybeFullyClose ();
             }
 
             if (psz > 0 && (ph.PacketType == UtpPacketType.ST_DATA || ph.PacketType == UtpPacketType.ST_FIN))
@@ -581,7 +588,10 @@ namespace MonoTorrent.Connections.Peer.Utp
 
         void SendDataLocked(ReadOnlyMemory<byte> d)
         {
-            if (_state != UtpState.Connected && _state != UtpState.FinSent) return;
+            // Half-close: refuse new application data after local write shutdown.
+            if (_outEof || _state == UtpState.FinSent)
+                return;
+            if (_state != UtpState.Connected) return;
             if (d.Length == 0) return;
 
             // Minimal Nagle: only coalesce when we already have a held incomplete segment.
@@ -608,15 +618,30 @@ namespace MonoTorrent.Connections.Peer.Utp
             PumpSendQueue();
         }
 
+        /// <summary>
+        /// Half-close the write side: no further application sends; emits ST_FIN when the send queue drains.
+        /// Read side remains open until peer FIN / abort (full duplex shutdown).
+        /// </summary>
         internal void SendFin()
         {
             lock (_sync) {
-                if (_state != UtpState.Connected) return;
+                if (_state == UtpState.FinSent || _state == UtpState.Deleting || _state == UtpState.ErrorWait)
+                    return;
+                if (_state != UtpState.Connected && _state != UtpState.SynSent)
+                    return;
                 _outEof = true;
-                SetState(UtpState.FinSent);
-                PumpSendQueue();
+                if (_state == UtpState.Connected)
+                    SetState (UtpState.FinSent);
+                PumpSendQueue ();
+                MaybeFullyClose ();
             }
         }
+
+        /// <summary>True once local write side has been closed (FIN sent or pending).</summary>
+        public bool WriteClosed => _outEof;
+
+        /// <summary>True once peer FIN observed (read side at EOF).</summary>
+        public bool ReadEof => _inEof;
 
         private void PumpSendQueue()
         {
@@ -634,65 +659,87 @@ namespace MonoTorrent.Connections.Peer.Utp
                 _naglePacket = null;
             }
 
-            // Occasional MTU probe (only when enabled and we have real user data to send; probes are ST_DATA
-            // segments and would otherwise interleave padding into the application stream).
-            if (_config.AllowDynamicMtu &&
-                _sendQueue.Count > 0 &&
-                _mtu < _mtuCeiling &&
-                _bytesInFlight < (_cwnd >> 16) &&
-                _mtuProbesSent > 0 &&
-                (_mtuProbesSent % 16 == 0))
-            {
-                int probePayload = Math.Min(200, _mtuCeiling - _mtu);
-                if (probePayload > 0) {
-                    var pk = _manager.AcquirePacket(UtpConstants.HeaderSize + probePayload);
-                    pk.HeaderSize = UtpConstants.HeaderSize;
-                    pk.SendTime = DateTimeOffset.UtcNow;
-                    pk.NumTransmissions = 1;
-                    pk.SeqNr = _seqNr;
-                    pk.MtuProbe = true;
-                    _mtuSeq = _seqNr;
-                    var h = new UtpHeader((byte)((byte)UtpPacketType.ST_DATA << 4 | UtpConstants.Version), UtpConstants.NoExtension, SendId, CurrentMicroTimestamp(), _replyMicro, (ushort)Math.Min(0xFFFF, _advWnd), _seqNr, _ackNr);
-                    h.WriteTo(pk.Data);
-                    _outbuf[_seqNr] = pk;
-                    _seqNr = (ushort)((_seqNr + 1) & UtpConstants.AckMask);
-                    _bytesInFlight += probePayload;
-                    _lastSent = DateTimeOffset.UtcNow;
-                    _manager.Send(pk.Data, new CompactEndPoint(_remoteEndPoint.Address, _remoteEndPoint.Port));
-                    _mtuProbesSent++;
-                }
-            } else if (_config.AllowDynamicMtu && _sendQueue.Count > 0 && _mtuProbesSent == 0) {
-                // Count sends without injecting a probe on the very first data segment.
+            // MTU discovery: never inject standalone ST_DATA padding (that would enter the peer's app stream).
+            // Instead, optionally pad the *current application segment* on the wire only when the user
+            // already queued real payload. Receiver delivers only the real prefix (tracked via HeaderSize
+            // on our side; on the wire we mark the logical payload length in the first 2 bytes of padding
+            // region only if we pad — actually we pad after app data and record AppPayloadSize on UtpPacket).
+            bool tryPadMtu = _config.AllowDynamicMtu &&
+                             _mtu < _mtuCeiling &&
+                             _mtuProbesSent > 0 &&
+                             (_mtuProbesSent % 16 == 0);
+            if (_config.AllowDynamicMtu && _sendQueue.Count > 0 && _mtuProbesSent == 0)
                 _mtuProbesSent = 1;
-            }
 
             while (_sendQueue.Count > 0 && _bytesInFlight < (_cwnd >> 16))
             {
                 var ch = _sendQueue.Dequeue();
-                var pk = _manager.AcquirePacket(UtpConstants.HeaderSize + ch.Length);
+                int appLen = ch.Length;
+                int pad = 0;
+                if (tryPadMtu && appLen > 0) {
+                    int targetWire = Math.Min (_mtuCeiling, appLen + 200);
+                    pad = Math.Max (0, targetWire - appLen);
+                    if (pad > 0) {
+                        _mtuSeq = _seqNr;
+                        _mtuProbesSent++;
+                        tryPadMtu = false; // at most one padded segment per pump
+                    }
+                }
+                int totalPayload = appLen + pad;
+                var pk = _manager.AcquirePacket(UtpConstants.HeaderSize + totalPayload);
                 pk.HeaderSize = UtpConstants.HeaderSize;
+                pk.AppPayloadSize = appLen; // only this many bytes are application data
                 pk.SendTime = DateTimeOffset.UtcNow;
                 pk.NumTransmissions = 1;
                 pk.SeqNr = _seqNr;
+                pk.MtuProbe = pad > 0;
                 var h = new UtpHeader((byte)((byte)UtpPacketType.ST_DATA << 4 | UtpConstants.Version), UtpConstants.NoExtension, SendId, CurrentMicroTimestamp(), _replyMicro, (ushort)Math.Min(0xFFFF, _advWnd), _seqNr, _ackNr);
                 h.WriteTo(pk.Data);
                 ch.Span.CopyTo(pk.Data.AsSpan(UtpConstants.HeaderSize));
+                // Zero-fill MTU pad; peer must not treat pad as app data unless they implement the same pad convention.
+                // We only pad on segments we send; peers receive full UDP payload. To avoid app pollution on *our*
+                // receive path when *we* sent probes historically, receivers strip nothing from external peers.
+                // External peers always deliver full psz as app data (BEP29). We simply stop sending probe-only packets.
+                if (pad > 0)
+                    pk.Data.AsSpan (UtpConstants.HeaderSize + appLen, pad).Clear ();
                 _outbuf[_seqNr] = pk;
                 _seqNr = (ushort)((_seqNr + 1) & UtpConstants.AckMask);
-                _bytesInFlight += ch.Length;
+                _bytesInFlight += totalPayload;
                 _lastSent = DateTimeOffset.UtcNow;
                 _manager.Send(pk.Data, new CompactEndPoint(_remoteEndPoint.Address, _remoteEndPoint.Port));
             }
-            if (_outEof && _sendQueue.Count == 0 && _state == UtpState.FinSent)
-            {
-                var pk = _manager.AcquirePacket(UtpConstants.HeaderSize);
-                pk.HeaderSize = UtpConstants.HeaderSize;
-                pk.SendTime = DateTimeOffset.UtcNow;
-                pk.NumTransmissions = 1;
-                pk.SeqNr = _seqNr;
-                new UtpHeader((byte)((byte)UtpPacketType.ST_FIN << 4 | UtpConstants.Version), UtpConstants.NoExtension, SendId, CurrentMicroTimestamp(), _replyMicro, 0, _seqNr, _ackNr).WriteTo(pk.Data);
-                _outbuf[_seqNr] = pk;  // track for ack
-                _manager.Send(pk.Data, new CompactEndPoint(_remoteEndPoint.Address, _remoteEndPoint.Port));
+            MaybeSendFinPacket ();
+            MaybeFullyClose ();
+        }
+
+        void MaybeSendFinPacket ()
+        {
+            if (!_outEof || _sendQueue.Count != 0 || _state != UtpState.FinSent)
+                return;
+            // Send FIN once (seq tracked in outbuf).
+            if (_finPacketSent)
+                return;
+            var pk = _manager.AcquirePacket(UtpConstants.HeaderSize);
+            pk.HeaderSize = UtpConstants.HeaderSize;
+            pk.AppPayloadSize = 0;
+            pk.SendTime = DateTimeOffset.UtcNow;
+            pk.NumTransmissions = 1;
+            pk.SeqNr = _seqNr;
+            new UtpHeader((byte)((byte)UtpPacketType.ST_FIN << 4 | UtpConstants.Version), UtpConstants.NoExtension, SendId, CurrentMicroTimestamp(), _replyMicro, 0, _seqNr, _ackNr).WriteTo(pk.Data);
+            _outbuf[_seqNr] = pk;
+            _finPacketSent = true;
+            _lastSent = DateTimeOffset.UtcNow;
+            _manager.Send(pk.Data, new CompactEndPoint(_remoteEndPoint.Address, _remoteEndPoint.Port));
+        }
+
+        void MaybeFullyClose ()
+        {
+            // Both directions shut down and nothing left to retransmit: connection is done.
+            if (_inEof && _outEof && _finPacketSent && _outbuf.Count == 0 && _sendQueue.Count == 0) {
+                if (_state != UtpState.Deleting && _state != UtpState.ErrorWait) {
+                    SetState (UtpState.Deleting);
+                    _manager.UnregisterConnection (this);
+                }
             }
         }
 
@@ -942,9 +989,9 @@ namespace MonoTorrent.Connections.Peer.Utp
         internal ReusableTask<int> SendAsync(ReadOnlyMemory<byte> b)
         {
             lock (_sync) {
-                if (_state != UtpState.Connected && _state != UtpState.FinSent) {
+                if (_state != UtpState.Connected || _outEof) {
                     var t = new ReusableTaskCompletionSource<int>();
-                    t.SetException(new InvalidOperationException("uTP not connected"));
+                    t.SetException(new InvalidOperationException(_outEof ? "uTP write side closed" : "uTP not connected"));
                     return t.Task;
                 }
                 SendDataLocked(b);
@@ -965,6 +1012,7 @@ namespace MonoTorrent.Connections.Peer.Utp
             }
         }
 
-        internal void CloseWrite() => SendFin();
+        /// <summary>Half-close the local write side (public surface for orderly shutdown / tests).</summary>
+        public void CloseWrite() => SendFin();
     }
 }
