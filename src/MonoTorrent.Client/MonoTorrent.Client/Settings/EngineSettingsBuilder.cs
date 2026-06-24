@@ -163,6 +163,48 @@ namespace MonoTorrent.Client
         /// </summary>
         public IPEndPoint? DhtEndPoint { get; set; }
 
+        /// <summary>Enable uTP (BEP 29) peer connections in addition to TCP.</summary>
+        public bool EnableUtp { get; set; } = true;
+
+        /// <summary>LEDBAT target delay in milliseconds.</summary>
+        public int UtpTargetDelayMilliseconds { get; set; } = 75;
+
+        /// <summary>LEDBAT gain factor.</summary>
+        public double UtpGainFactor { get; set; } = 1.0;
+
+        /// <summary>Advertised uTP receive window (bytes).</summary>
+        public int UtpReceiveWindow { get; set; } = 1024 * 1024;
+
+        /// <summary>uTP max packet size / initial MTU.</summary>
+        public int UtpMaxPacketSize { get; set; } = 1500;
+
+        /// <summary>Enable dynamic MTU for uTP.</summary>
+        public bool UtpAllowDynamicMtu { get; set; } = true;
+
+        /// <summary>Minimum uTP RTO (ms).</summary>
+        public int UtpMinTimeoutMilliseconds { get; set; } = 500;
+
+        /// <summary>Initial uTP RTO (ms).</summary>
+        public int UtpInitialTimeoutMilliseconds { get; set; } = 1000;
+
+        /// <summary>SYN resend limit.</summary>
+        public int UtpSynResends { get; set; } = 2;
+
+        /// <summary>FIN resend limit.</summary>
+        public int UtpFinResends { get; set; } = 2;
+
+        /// <summary>DATA resend limit.</summary>
+        public int UtpNumResends { get; set; } = 3;
+
+        /// <summary>uTP connect timeout (ms).</summary>
+        public int UtpConnectTimeoutMilliseconds { get; set; } = 30_000;
+
+        /// <summary>uTP manager tick interval.</summary>
+        public TimeSpan UtpTickInterval { get; set; } = TimeSpan.FromMilliseconds (50);
+
+        /// <summary>Maximum concurrent uTP sockets.</summary>
+        public int UtpMaxConnections { get; set; } = 200;
+
         /// <summary>
         /// When <see cref="EngineSettings.AutoSaveLoadFastResume"/> is true, this setting is used to control how fast
         /// resume data is maintained, otherwise it has no effect. You can prioritise accuracy (at the risk of requiring full hash checks if an actively downloading
@@ -362,6 +404,20 @@ namespace MonoTorrent.Client
             WebSeedConnectionTimeout = settings.WebSeedConnectionTimeout;
             WebSeedDelay = settings.WebSeedDelay;
             WebSeedSpeedTrigger = settings.WebSeedSpeedTrigger;
+            EnableUtp = settings.EnableUtp;
+            UtpTargetDelayMilliseconds = settings.UtpTargetDelayMilliseconds;
+            UtpGainFactor = settings.UtpGainFactor;
+            UtpReceiveWindow = settings.UtpReceiveWindow;
+            UtpMaxPacketSize = settings.UtpMaxPacketSize;
+            UtpAllowDynamicMtu = settings.UtpAllowDynamicMtu;
+            UtpMinTimeoutMilliseconds = settings.UtpMinTimeoutMilliseconds;
+            UtpInitialTimeoutMilliseconds = settings.UtpInitialTimeoutMilliseconds;
+            UtpSynResends = settings.UtpSynResends;
+            UtpFinResends = settings.UtpFinResends;
+            UtpNumResends = settings.UtpNumResends;
+            UtpConnectTimeoutMilliseconds = settings.UtpConnectTimeoutMilliseconds;
+            UtpTickInterval = settings.UtpTickInterval;
+            UtpMaxConnections = settings.UtpMaxConnections;
         }
 
         public EngineSettings ToSettings ()
@@ -421,7 +477,21 @@ namespace MonoTorrent.Client
                 usePartialFiles: UsePartialFiles,
                 webSeedConnectionTimeout: WebSeedConnectionTimeout,
                 webSeedDelay: WebSeedDelay,
-                webSeedSpeedTrigger: webSeedSpeedTrigger
+                webSeedSpeedTrigger: webSeedSpeedTrigger,
+                enableUtp: EnableUtp,
+                utpTargetDelayMilliseconds: UtpTargetDelayMilliseconds,
+                utpGainFactor: UtpGainFactor,
+                utpReceiveWindow: UtpReceiveWindow,
+                utpMaxPacketSize: UtpMaxPacketSize,
+                utpAllowDynamicMtu: UtpAllowDynamicMtu,
+                utpMinTimeoutMilliseconds: UtpMinTimeoutMilliseconds,
+                utpInitialTimeoutMilliseconds: UtpInitialTimeoutMilliseconds,
+                utpSynResends: UtpSynResends,
+                utpFinResends: UtpFinResends,
+                utpNumResends: UtpNumResends,
+                utpConnectTimeoutMilliseconds: UtpConnectTimeoutMilliseconds,
+                utpTickInterval: UtpTickInterval,
+                utpMaxConnections: UtpMaxConnections
             );
         }
 

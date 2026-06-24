@@ -43,6 +43,12 @@ namespace MonoTorrent
     public sealed class PeerInfo : IEquatable<PeerInfo>
     {
         public bool MaybeSeeder { get; }
+
+        /// <summary>
+        /// True when the peer is known to support uTP (BEP 29), e.g. from PEX added.f bit 0x04.
+        /// </summary>
+        public bool SupportsUtp { get; }
+
         public BEncodedString PeerId { get; }
 
         public Uri ConnectionUri { get; }
@@ -64,11 +70,17 @@ namespace MonoTorrent
         {
         }
 
-        PeerInfo (Uri connectionUri, BEncodedString peerId, bool maybeSeeder, IPEndPoint? endPoint)
+        public PeerInfo (Uri connectionUri, BEncodedString peerId, bool maybeSeeder, bool supportsUtp)
+            : this (connectionUri, peerId, maybeSeeder, null, supportsUtp)
+        {
+        }
+
+        PeerInfo (Uri connectionUri, BEncodedString peerId, bool maybeSeeder, IPEndPoint? endPoint, bool supportsUtp = false)
         {
             ConnectionUri = connectionUri ?? throw new ArgumentNullException (nameof (connectionUri));
             PeerId = peerId ?? throw new ArgumentNullException (nameof (peerId));
             MaybeSeeder = maybeSeeder;
+            SupportsUtp = supportsUtp;
             EndPoint = endPoint ?? (IPAddress.TryParse (connectionUri.Host, out var ip) ? new IPEndPoint (ip, connectionUri.Port) : null);
         }
 

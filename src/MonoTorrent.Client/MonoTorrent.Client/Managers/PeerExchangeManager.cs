@@ -145,6 +145,7 @@ namespace MonoTorrent.Client
                 }
 
                 addedDotF.Span[i] |= (byte) (peer.IsSeeder ? 0x02 : 0x00);
+                addedDotF.Span[i] |= (byte) (peer.Peer.SupportsUtp ? 0x04 : 0x00);
             }
 
             // The remainder of our buffer can be filled with dropped peers.

@@ -178,12 +178,18 @@ namespace MonoTorrent.Client.Modes
                     return;
 
                 var newPeers =  PeerInfo.FromCompact (message.Added, AddressFamily.InterNetwork);
-                for (int i = 0; i < newPeers.Count && i < message.AddedDotF.Length; i++)
-                    newPeers[i] = new PeerInfo (newPeers[i].ConnectionUri, newPeers[i].PeerId, (message.AddedDotF[i] & 0x2) == 0x2);
+                for (int i = 0; i < newPeers.Count && i < message.AddedDotF.Length; i++) {
+                    bool isSeeder = (message.AddedDotF[i] & 0x2) == 0x2;
+                    bool supportsUtp = (message.AddedDotF[i] & 0x4) == 0x4;
+                    newPeers[i] = new PeerInfo (newPeers[i].ConnectionUri, newPeers[i].PeerId, isSeeder, supportsUtp);
+                }
 
                 var newPeers2 = PeerInfo.FromCompact (message.Added6, AddressFamily.InterNetworkV6);
-                for (int i = 0; i < newPeers2.Count && i < message.Added6DotF.Length; i++)
-                    newPeers2[i] = new PeerInfo (newPeers2[i].ConnectionUri, newPeers2[i].PeerId, (message.Added6DotF[i] & 0x2) == 0x2);
+                for (int i = 0; i < newPeers2.Count && i < message.Added6DotF.Length; i++) {
+                    bool isSeeder = (message.Added6DotF[i] & 0x2) == 0x2;
+                    bool supportsUtp = (message.Added6DotF[i] & 0x4) == 0x4;
+                    newPeers2[i] = new PeerInfo (newPeers2[i].ConnectionUri, newPeers2[i].PeerId, isSeeder, supportsUtp);
+                }
 
                 // Peer exchange is more likely to provide fresh/connectable peers than trackers or dht.
                 // Prioritise them to the top of the list.

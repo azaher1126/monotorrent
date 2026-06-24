@@ -70,6 +70,11 @@ namespace MonoTorrent.Client
         internal PeerInfo Info { get; private set; }
 
         /// <summary>
+        /// True when this peer supports or was connected via uTP (BEP 29). Propagated to PEX as added.f bit 0x04.
+        /// </summary>
+        internal bool SupportsUtp { get; set; }
+
+        /// <summary>
         /// The number of times, in a row, that this peer has sent us the blocks for a piece and that
         /// piece failed the hash check.
         /// </summary>
@@ -89,6 +94,7 @@ namespace MonoTorrent.Client
         public Peer (PeerInfo peerInfo)
         {
             Info = peerInfo ?? throw new ArgumentNullException (nameof (peerInfo));
+            SupportsUtp = peerInfo.SupportsUtp;
         }
 
         public override bool Equals (object? obj)

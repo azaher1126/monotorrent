@@ -163,6 +163,79 @@ namespace MonoTorrent.Client
         public IPEndPoint? DhtEndPoint { get; } = new IPEndPoint (IPAddress.Any, 0);
 
         /// <summary>
+        /// If true, the engine listens for and initiates uTP (BEP 29 / micro Transport Protocol) connections
+        /// in addition to TCP. uTP uses LEDBAT delay-based congestion control and shares UDP sockets with DHT
+        /// when listen ports coincide. Defaults to <see langword="true"/>.
+        /// </summary>
+        public bool EnableUtp { get; } = true;
+
+        /// <summary>
+        /// LEDBAT target one-way delay in milliseconds. Lower values yield more aggressively to other traffic.
+        /// libtorrent uses 75ms. Only applies when <see cref="EnableUtp"/> is true. Defaults to 75.
+        /// </summary>
+        public int UtpTargetDelayMilliseconds { get; } = 75;
+
+        /// <summary>
+        /// LEDBAT gain factor applied to off-target cwnd adjustments. Defaults to 1.0.
+        /// </summary>
+        public double UtpGainFactor { get; } = 1.0;
+
+        /// <summary>
+        /// Advertised uTP receive window in bytes. Defaults to 1 MiB.
+        /// </summary>
+        public int UtpReceiveWindow { get; } = 1024 * 1024;
+
+        /// <summary>
+        /// Initial / maximum uTP packet size before path MTU discovery. Defaults to 1500.
+        /// </summary>
+        public int UtpMaxPacketSize { get; } = 1500;
+
+        /// <summary>
+        /// Whether to enable dynamic MTU / path MTU discovery for uTP. Defaults to <see langword="true"/>.
+        /// </summary>
+        public bool UtpAllowDynamicMtu { get; } = true;
+
+        /// <summary>
+        /// Minimum uTP retransmission timeout in milliseconds. Defaults to 500.
+        /// </summary>
+        public int UtpMinTimeoutMilliseconds { get; } = 500;
+
+        /// <summary>
+        /// Initial uTP retransmission timeout in milliseconds (before RTT samples). Defaults to 1000.
+        /// </summary>
+        public int UtpInitialTimeoutMilliseconds { get; } = 1000;
+
+        /// <summary>
+        /// Maximum SYN retransmissions before failing a uTP connect attempt. Defaults to 2.
+        /// </summary>
+        public int UtpSynResends { get; } = 2;
+
+        /// <summary>
+        /// Maximum FIN retransmissions. Defaults to 2.
+        /// </summary>
+        public int UtpFinResends { get; } = 2;
+
+        /// <summary>
+        /// Maximum DATA retransmissions before aborting the connection. Defaults to 3.
+        /// </summary>
+        public int UtpNumResends { get; } = 3;
+
+        /// <summary>
+        /// Overall uTP connection establishment timeout in milliseconds. Defaults to 30000.
+        /// </summary>
+        public int UtpConnectTimeoutMilliseconds { get; } = 30_000;
+
+        /// <summary>
+        /// How often the uTP manager ticks all sockets (retransmit / LEDBAT / timeouts). Defaults to 50ms.
+        /// </summary>
+        public TimeSpan UtpTickInterval { get; } = TimeSpan.FromMilliseconds (50);
+
+        /// <summary>
+        /// Hard limit on concurrent uTP sockets. Defaults to 200.
+        /// </summary>
+        public int UtpMaxConnections { get; } = 200;
+
+        /// <summary>
         /// This is the full path to a sub-directory of <see cref="CacheDirectory"/>. If <see cref="AutoSaveLoadFastResume"/>
         /// is enabled then fast resume data will be written to this when <see cref="TorrentManager.StopAsync"/> or
         /// <see cref="ClientEngine.StopAllAsync"/> is invoked. If fast resume data is available, the data will be loaded
@@ -306,7 +379,11 @@ namespace MonoTorrent.Client
             int maximumConnections, int maximumDiskReadRate, int maximumDiskWriteRate, int maximumDownloadRate, int maximumHalfOpenConnections,
             int maximumOpenFiles, int maximumUploadRate, IDictionary<string, IPEndPoint> reportedListenEndPoints, bool usePartialFiles,
             TimeSpan webSeedConnectionTimeout, TimeSpan webSeedDelay, int webSeedSpeedTrigger, TimeSpan staleRequestTimeout,
-            string httpStreamingPrefix, IList<TimeSpan> connectionRetryDelays)
+            string httpStreamingPrefix, IList<TimeSpan> connectionRetryDelays,
+            bool enableUtp = true, int utpTargetDelayMilliseconds = 75, double utpGainFactor = 1.0, int utpReceiveWindow = 1024 * 1024,
+            int utpMaxPacketSize = 1500, bool utpAllowDynamicMtu = true, int utpMinTimeoutMilliseconds = 500,
+            int utpInitialTimeoutMilliseconds = 1000, int utpSynResends = 2, int utpFinResends = 2, int utpNumResends = 3,
+            int utpConnectTimeoutMilliseconds = 30_000, TimeSpan? utpTickInterval = null, int utpMaxConnections = 200)
         {
             // Make sure this is immutable now
             AllowedEncryption = EncryptionTypes.MakeReadOnly (allowedEncryption.ToArray ());
@@ -342,6 +419,20 @@ namespace MonoTorrent.Client
             WebSeedConnectionTimeout = webSeedConnectionTimeout;
             WebSeedDelay = webSeedDelay;
             WebSeedSpeedTrigger = webSeedSpeedTrigger;
+            EnableUtp = enableUtp;
+            UtpTargetDelayMilliseconds = utpTargetDelayMilliseconds;
+            UtpGainFactor = utpGainFactor;
+            UtpReceiveWindow = utpReceiveWindow;
+            UtpMaxPacketSize = utpMaxPacketSize;
+            UtpAllowDynamicMtu = utpAllowDynamicMtu;
+            UtpMinTimeoutMilliseconds = utpMinTimeoutMilliseconds;
+            UtpInitialTimeoutMilliseconds = utpInitialTimeoutMilliseconds;
+            UtpSynResends = utpSynResends;
+            UtpFinResends = utpFinResends;
+            UtpNumResends = utpNumResends;
+            UtpConnectTimeoutMilliseconds = utpConnectTimeoutMilliseconds;
+            UtpTickInterval = utpTickInterval ?? TimeSpan.FromMilliseconds (50);
+            UtpMaxConnections = utpMaxConnections;
         }
 
         static IList<IList<EncryptionType>> UpdateEncryptionTiers (IList<EncryptionType> allowedEncryption)
@@ -365,6 +456,27 @@ namespace MonoTorrent.Client
             }
             return tiers;
         }
+
+
+        /// <summary>
+        /// Builds a <see cref="MonoTorrent.Connections.Peer.Utp.UtpConfig"/> snapshot from these engine settings.
+        /// </summary>
+        internal MonoTorrent.Connections.Peer.Utp.UtpConfig CreateUtpConfig ()
+            => new MonoTorrent.Connections.Peer.Utp.UtpConfig {
+                TargetDelayMilliseconds = UtpTargetDelayMilliseconds,
+                GainFactor = UtpGainFactor,
+                ReceiveWindow = UtpReceiveWindow,
+                MaxPacketSize = UtpMaxPacketSize,
+                AllowDynamicMtu = UtpAllowDynamicMtu,
+                MinTimeoutMilliseconds = UtpMinTimeoutMilliseconds,
+                InitialTimeoutMilliseconds = UtpInitialTimeoutMilliseconds,
+                SynResends = UtpSynResends,
+                FinResends = UtpFinResends,
+                NumResends = UtpNumResends,
+                ConnectTimeoutMilliseconds = UtpConnectTimeoutMilliseconds,
+                TickInterval = UtpTickInterval,
+                MaxConnections = UtpMaxConnections,
+            };
 
         internal string GetDhtNodeCacheFilePath ()
             => Path.Combine (CacheDirectory, "dht_nodes.cache");
@@ -417,6 +529,20 @@ namespace MonoTorrent.Client
                    && WebSeedConnectionTimeout == other.WebSeedConnectionTimeout
                    && WebSeedDelay == other.WebSeedDelay
                    && WebSeedSpeedTrigger == other.WebSeedSpeedTrigger
+                   && EnableUtp == other.EnableUtp
+                   && UtpTargetDelayMilliseconds == other.UtpTargetDelayMilliseconds
+                   && UtpGainFactor == other.UtpGainFactor
+                   && UtpReceiveWindow == other.UtpReceiveWindow
+                   && UtpMaxPacketSize == other.UtpMaxPacketSize
+                   && UtpAllowDynamicMtu == other.UtpAllowDynamicMtu
+                   && UtpMinTimeoutMilliseconds == other.UtpMinTimeoutMilliseconds
+                   && UtpInitialTimeoutMilliseconds == other.UtpInitialTimeoutMilliseconds
+                   && UtpSynResends == other.UtpSynResends
+                   && UtpFinResends == other.UtpFinResends
+                   && UtpNumResends == other.UtpNumResends
+                   && UtpConnectTimeoutMilliseconds == other.UtpConnectTimeoutMilliseconds
+                   && UtpTickInterval == other.UtpTickInterval
+                   && UtpMaxConnections == other.UtpMaxConnections
                    ;
         }
 
