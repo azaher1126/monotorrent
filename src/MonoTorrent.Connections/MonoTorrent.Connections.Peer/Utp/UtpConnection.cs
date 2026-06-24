@@ -558,12 +558,12 @@ namespace MonoTorrent.Connections.Peer.Utp
                 _naglePacket = null;
             }
 
-            if (d.Length < 500)
+            // Only hold small writes when something is already in-flight (Nagle); otherwise send immediately.
+            if (d.Length < 500 && _bytesInFlight > 0)
             {
-                // start new nagle hold
-                _naglePacket = _manager.AcquirePacket(d.Length + UtpConstants.HeaderSize); // will fill later
-                _naglePacket.Data = d.ToArray(); // simple copy for hold
-                _naglePacket.HeaderSize = 0; // filled at send time
+                _naglePacket = _manager.AcquirePacket(d.Length + UtpConstants.HeaderSize);
+                _naglePacket.Data = d.ToArray();
+                _naglePacket.HeaderSize = 0;
                 return;
             }
 
