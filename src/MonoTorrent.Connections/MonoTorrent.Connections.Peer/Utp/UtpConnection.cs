@@ -22,6 +22,7 @@
 using System;
 using System.Collections.Generic;
 using System.Net;
+using System.Threading;
 
 using MonoTorrent.Connections;
 
@@ -101,6 +102,8 @@ namespace MonoTorrent.Connections.Peer.Utp
         readonly bool _isIncoming;
         int _targetDelayMs;
         readonly UtpConfig _config;
+        // Serializes protocol + stream access (manager tick, UDP receive, and IPeerConnection I/O may race).
+        readonly object _sync = new object ();
 
         public ushort RecvId { get; internal set; }
         public ushort SendId { get; internal set; }
@@ -210,16 +213,20 @@ namespace MonoTorrent.Connections.Peer.Utp
 
         public void Abort()
         {
-            _error = new System.IO.IOException("uTP connection aborted");
-            // Release pooled packets
-            foreach (var p in _outbuf.Values) _manager.ReleasePacket(p);
-            foreach (var p in _inbuf.Values) _manager.ReleasePacket(p);
-            _outbuf.Clear();
-            _inbuf.Clear();
-            if (_naglePacket != null) { _manager.ReleasePacket(_naglePacket); _naglePacket = null; }
-            SetState(UtpState.Deleting);
+            lock (_sync) {
+                if (_state == UtpState.Deleting)
+                    return;
+                _error = new System.IO.IOException("uTP connection aborted");
+                foreach (var p in _outbuf.Values) _manager.ReleasePacket(p);
+                foreach (var p in _inbuf.Values) _manager.ReleasePacket(p);
+                _outbuf.Clear();
+                _inbuf.Clear();
+                if (_naglePacket != null) { _manager.ReleasePacket(_naglePacket); _naglePacket = null; }
+                SetState(UtpState.Deleting);
+            }
             _manager.UnregisterConnection(this);
-            DrainReceivesWithError();
+            lock (_sync)
+                DrainReceivesWithError();
         }
 
         private void DrainReceivesWithError()
@@ -236,24 +243,32 @@ namespace MonoTorrent.Connections.Peer.Utp
 
         internal void SendSyn()
         {
-            if (_state != UtpState.None) return;
-            SetState(UtpState.SynSent);
+            lock (_sync) {
+                if (_state != UtpState.None) return;
+                SetState(UtpState.SynSent);
 
-            var pkt = _manager.AcquirePacket(UtpConstants.HeaderSize);
-            pkt.HeaderSize = UtpConstants.HeaderSize;
-            pkt.SendTime = DateTimeOffset.UtcNow;
-            pkt.NumTransmissions = 1;
-            pkt.SeqNr = _seqNr;
-            var h = new UtpHeader((byte)((byte)UtpPacketType.ST_SYN << 4 | UtpConstants.Version), UtpConstants.NoExtension, SendId, CurrentMicroTimestamp(), _replyMicro, (ushort)Math.Min(ushort.MaxValue, 64 * 1024), _seqNr, 0);
-            h.WriteTo(pkt.Data);
-            _outbuf[_seqNr] = pkt;
-            _seqNr = (ushort)((_seqNr + 1) & UtpConstants.AckMask);
-            _lastSent = DateTimeOffset.UtcNow;
-            _timeout = DateTimeOffset.UtcNow + TimeSpan.FromMilliseconds(3000);
-            _manager.Send(pkt.Data, new CompactEndPoint(_remoteEndPoint.Address, _remoteEndPoint.Port));
+                var pkt = _manager.AcquirePacket(UtpConstants.HeaderSize);
+                pkt.HeaderSize = UtpConstants.HeaderSize;
+                pkt.SendTime = DateTimeOffset.UtcNow;
+                pkt.NumTransmissions = 1;
+                pkt.SeqNr = _seqNr;
+                var h = new UtpHeader((byte)((byte)UtpPacketType.ST_SYN << 4 | UtpConstants.Version), UtpConstants.NoExtension, SendId, CurrentMicroTimestamp(), _replyMicro, (ushort)Math.Min(ushort.MaxValue, 64 * 1024), _seqNr, 0);
+                h.WriteTo(pkt.Data);
+                _outbuf[_seqNr] = pkt;
+                _seqNr = (ushort)((_seqNr + 1) & UtpConstants.AckMask);
+                _lastSent = DateTimeOffset.UtcNow;
+                _timeout = DateTimeOffset.UtcNow + TimeSpan.FromMilliseconds(3000);
+                _manager.Send(pkt.Data, new CompactEndPoint(_remoteEndPoint.Address, _remoteEndPoint.Port));
+            }
         }
 
         internal void ProcessIncoming(UtpHeader ph, ReadOnlyMemory<byte> fullDatagram, CompactEndPoint remote)
+        {
+            lock (_sync)
+                ProcessIncomingLocked (ph, fullDatagram, remote);
+        }
+
+        void ProcessIncomingLocked(UtpHeader ph, ReadOnlyMemory<byte> fullDatagram, CompactEndPoint remote)
         {
             if (_state == UtpState.Deleting || _state == UtpState.ErrorWait) return;
             var buf = fullDatagram.Span;
@@ -292,7 +307,12 @@ namespace MonoTorrent.Connections.Peer.Utp
             // Active open: peer STATE/DATA/FIN completes the three-way handshake.
             else if (_state == UtpState.SynSent &&
                      (ph.PacketType == UtpPacketType.ST_STATE || ph.PacketType == UtpPacketType.ST_DATA || ph.PacketType == UtpPacketType.ST_FIN)) {
-                _ackNr = ph.SeqNr;
+                // Peer's STATE carries seq_nr of the *next* segment they will send (STATE does not consume a seq).
+                // Record last fully received peer seq as seq_nr - 1 so nextExpected == ph.SeqNr for first DATA.
+                if (ph.PacketType == UtpPacketType.ST_STATE)
+                    _ackNr = (ushort) ((ph.SeqNr - 1) & UtpConstants.AckMask);
+                else
+                    _ackNr = ph.SeqNr;
                 // Advance our acked cursor to include the SYN we sent (peer should ack it in AckNr).
                 if (CompareLessWrap (_ackedSeqNr, ph.AckNr, UtpConstants.AckMask) || _ackedSeqNr == ph.AckNr)
                     _ackedSeqNr = ph.AckNr;
@@ -395,7 +415,7 @@ namespace MonoTorrent.Connections.Peer.Utp
                 {
                     _fastResendSeqNr = (ushort)((_fastResendSeqNr + 1) & UtpConstants.AckMask);
                     if (!pp.MtuProbe) ExperiencedLoss(_fastResendSeqNr, now);
-                    ResendPacket(pp, true);
+                    ResendPacket(pp, false);
                 }
             }
 
@@ -416,6 +436,7 @@ namespace MonoTorrent.Connections.Peer.Utp
                     _inEof = true;
                     _inEofSeqNr = (ushort) ((ph.SeqNr + (psz > 0 ? 1u : 0u)) & UtpConstants.AckMask);
                 }
+                TrySignalEofToWaiters ();
             }
 
             if (psz > 0 && (ph.PacketType == UtpPacketType.ST_DATA || ph.PacketType == UtpPacketType.ST_FIN))
@@ -524,7 +545,9 @@ namespace MonoTorrent.Connections.Peer.Utp
             p.NeedResend = false;
             p.SendTime = DateTimeOffset.UtcNow;
             _manager.Send(p.Data, new CompactEndPoint(_remoteEndPoint.Address, _remoteEndPoint.Port));
-            _bytesInFlight += p.PayloadSize;
+            // In-flight accounting already includes this segment; only adjust on first send, not retransmit.
+            if (f)
+                _bytesInFlight += p.PayloadSize;
         }
 
         private void DoLedbat(int ab, int dl, int inf)
@@ -551,6 +574,12 @@ namespace MonoTorrent.Connections.Peer.Utp
         }
 
         internal void SendData(ReadOnlyMemory<byte> d)
+        {
+            lock (_sync)
+                SendDataLocked (d);
+        }
+
+        void SendDataLocked(ReadOnlyMemory<byte> d)
         {
             if (_state != UtpState.Connected && _state != UtpState.FinSent) return;
             if (d.Length == 0) return;
@@ -581,10 +610,12 @@ namespace MonoTorrent.Connections.Peer.Utp
 
         internal void SendFin()
         {
-            if (_state != UtpState.Connected) return;
-            _outEof = true;
-            SetState(UtpState.FinSent);
-            PumpSendQueue();
+            lock (_sync) {
+                if (_state != UtpState.Connected) return;
+                _outEof = true;
+                SetState(UtpState.FinSent);
+                PumpSendQueue();
+            }
         }
 
         private void PumpSendQueue()
@@ -718,6 +749,12 @@ namespace MonoTorrent.Connections.Peer.Utp
 
         internal void Tick(long nt)
         {
+            lock (_sync)
+                TickLocked (nt);
+        }
+
+        void TickLocked(long nt)
+        {
             if (_state == UtpState.Deleting || _state == UtpState.ErrorWait) return;
             var n = DateTimeOffset.UtcNow;
 
@@ -726,6 +763,13 @@ namespace MonoTorrent.Connections.Peer.Utp
             {
                 SendStatePacket();
                 _deferredAck = false;
+            }
+
+            // Retransmit segments marked NeedResend (set on RTO or explicit loss handling).
+            foreach (var kv in _outbuf) {
+                var p = kv.Value;
+                if (p != null && p.NeedResend)
+                    ResendPacket (p, false);
             }
 
             if (n > _timeout)
@@ -738,7 +782,12 @@ namespace MonoTorrent.Connections.Peer.Utp
                     ig = true;
                 }
                 if (_outbuf.Count > 0 || _outEof) { if (!ig) ++_numTimeouts; }
-                if (_numTimeouts > 6 || (_numTimeouts > 0 && !_confirmed)) { _error = new TimeoutException("uTP timeout"); SetState(UtpState.ErrorWait); _manager.UnregisterConnection(this); return; }
+                if (_numTimeouts > 6 || (_numTimeouts > 0 && !_confirmed)) {
+                    _error = new TimeoutException("uTP timeout");
+                    SetState(UtpState.ErrorWait);
+                    _manager.UnregisterConnection(this);
+                    return;
+                }
                 if (!ig)
                 {
                     _cwnd = (_bytesInFlight == 0 && (_cwnd >> 16) >= _mtu) ? Math.Max(_cwnd * 2 / 3, (long)_mtu << 16) : (long)_mtu << 16;
@@ -747,6 +796,10 @@ namespace MonoTorrent.Connections.Peer.Utp
                 _mtuSeq = 0;
                 _timeout = n + TimeSpan.FromMilliseconds(PacketTimeout());
                 foreach (var kv in _outbuf) if (kv.Value != null) kv.Value.NeedResend = true;
+                foreach (var kv in _outbuf) {
+                    if (kv.Value != null && kv.Value.NeedResend)
+                        ResendPacket (kv.Value, false);
+                }
                 PumpSendQueue();
             }
         }
@@ -848,6 +901,12 @@ namespace MonoTorrent.Connections.Peer.Utp
 
         internal ReusableTask<int> ReceiveAsync(Memory<byte> b)
         {
+            lock (_sync)
+                return ReceiveAsyncLocked (b);
+        }
+
+        ReusableTask<int> ReceiveAsyncLocked(Memory<byte> b)
+        {
             if (b.Length == 0)
                 return ReusableTask.FromResult(0);
 
@@ -882,9 +941,28 @@ namespace MonoTorrent.Connections.Peer.Utp
 
         internal ReusableTask<int> SendAsync(ReadOnlyMemory<byte> b)
         {
-            if (_state != UtpState.Connected && _state != UtpState.FinSent) { var t = new ReusableTaskCompletionSource<int>(); t.SetException(new InvalidOperationException("uTP not connected")); return t.Task; }
-            SendData(b);
-            return ReusableTask.FromResult(b.Length);
+            lock (_sync) {
+                if (_state != UtpState.Connected && _state != UtpState.FinSent) {
+                    var t = new ReusableTaskCompletionSource<int>();
+                    t.SetException(new InvalidOperationException("uTP not connected"));
+                    return t.Task;
+                }
+                SendDataLocked(b);
+                return ReusableTask.FromResult(b.Length);
+            }
+        }
+
+        /// <summary>Completes pending receives with 0 once peer FIN has been observed and the buffer is drained.</summary>
+        void TrySignalEofToWaiters()
+        {
+            if (!_inEof || _receiveBuffer.Count > 0)
+                return;
+            while (_pendingReceives.Count > 0) {
+                var tcs = _pendingReceives.Dequeue();
+                if (_pendingReceiveBuffers.Count > 0)
+                    _pendingReceiveBuffers.Dequeue();
+                tcs.SetResult(0);
+            }
         }
 
         internal void CloseWrite() => SendFin();
