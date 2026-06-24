@@ -7,15 +7,14 @@
   <PropertyGroup>
     <UseCache>true</UseCache>
     <UseIListExtensions>true</UseIListExtensions>
-    <UseSimpleSpinLock>true</UseSimpleSpinLock>
+    <!-- SpinLocked centralized in the core MonoTorrent library (via ProjectReference + InternalsVisibleTo).
+         Setting this false prevents duplicate type definitions across assemblies. -->
+    <UseSimpleSpinLock>false</UseSimpleSpinLock>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="GitInfo" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="..\MonoTorrent\MonoTorrent.csproj" />
+    <ProjectReference Include="..\MonoTorrent\MonoTorrent.csproj" PrivateAssets="all" />
   </ItemGroup>
 
 </Project>

@@ -6,11 +6,14 @@
 
   <PropertyGroup>
     <UseBitOps>true</UseBitOps>
-    <UseSimpleSpinLock>true</UseSimpleSpinLock>
+    <!-- SpinLocked centralized in the core MonoTorrent library (via ProjectReference + InternalsVisibleTo).
+         Setting this false prevents duplicate type definitions across assemblies. --> 
+    <UseSimpleSpinLock>false</UseSimpleSpinLock>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="GitInfo" />
+    <ProjectReference Include="..\MonoTorrent\MonoTorrent.csproj" PrivateAssets="all" />
   </ItemGroup>
 
   <ItemGroup>

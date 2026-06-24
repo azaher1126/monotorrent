@@ -6,13 +6,16 @@
 
   <PropertyGroup>
     <UseLogger>true</UseLogger>
-    <UseSimpleSpinLock>true</UseSimpleSpinLock>
-    <UseThreadSwitcher>true</UseThreadSwitcher>
-    <UseValueStopWatch>true</UseValueStopWatch>
+    <!-- SpinLocked centralized in the core MonoTorrent library (via ProjectReference + InternalsVisibleTo).
+         Setting this false prevents duplicate type definitions across assemblies. --> 
+    <UseSimpleSpinLock>false</UseSimpleSpinLock>
+    <UseThreadSwitcher>false</UseThreadSwitcher>
+    <UseValueStopWatch>false</UseValueStopWatch>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="GitInfo" />
+    <ProjectReference Include="..\MonoTorrent\MonoTorrent.csproj" PrivateAssets="all" />
   </ItemGroup>
 
   <ItemGroup>

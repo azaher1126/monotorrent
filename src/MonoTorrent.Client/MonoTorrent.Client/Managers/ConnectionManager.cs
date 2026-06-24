@@ -179,7 +179,20 @@ namespace MonoTorrent.Client
                     return ConnectionFailureReason.Unknown;
 
                 // Create a new IPeerConnection object for each connection attempt.
-                var connection = Factories.CreatePeerConnection (peer.Info.ConnectionUri);
+                // When the engine has registered uTP creators (i.e. EnableUtp was true), we try the
+                // "utp-ipv*" scheme first. This gives us a UtpPeerConnection (full UDP sharing + LEDBAT)
+                // while still falling back to plain TCP if the utp-* creator isn't present or fails.
+                IPeerConnection? connection = null;
+                if (peer.Info.ConnectionUri.Scheme == "ipv4" || peer.Info.ConnectionUri.Scheme == "ipv6") {
+                    var utpScheme = peer.Info.ConnectionUri.Scheme == "ipv6" ? "utp-ipv6" : "utp-ipv4";
+                    try {
+                        var original = peer.Info.ConnectionUri.ToString ();
+                    var utpUri = new Uri (original.Replace (peer.Info.ConnectionUri.Scheme + "://", utpScheme + "://"));
+                        connection = Factories.CreatePeerConnection (utpUri);
+                    } catch { }
+                }
+
+                connection ??= Factories.CreatePeerConnection (peer.Info.ConnectionUri);
                 if (connection == null)
                     return ConnectionFailureReason.UnknownUriSchema;
 

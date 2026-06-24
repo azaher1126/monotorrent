@@ -9,6 +9,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\MonoTorrent\MonoTorrent.csproj" PrivateAssets="all" />
     <ProjectReference Include="..\MonoTorrent.Connections\MonoTorrent.Connections.csproj" PrivateAssets="all" />
     <ProjectReference Include="..\MonoTorrent.Dht\MonoTorrent.Dht.csproj" PrivateAssets="all" />
     <ProjectReference Include="..\MonoTorrent.PiecePicking\MonoTorrent.PiecePicking.csproj" PrivateAssets="all" />

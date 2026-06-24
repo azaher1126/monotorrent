@@ -9,18 +9,22 @@
   </PropertyGroup>
 
   <PropertyGroup>
-    <UseBigEndianBigInteger>true</UseBigEndianBigInteger>
+    <UseBigEndianBigInteger>false</UseBigEndianBigInteger>
     <UseBitOps>true</UseBitOps>
-    <UseCache>true</UseCache>
-    <UseEnsureThreadPool>true</UseEnsureThreadPool>
-    <UseIListExtensions>true</UseIListExtensions>
+    <!-- These shared internal utilities (Cache, MainLoop, IListExtensions, TorrentFileExtensions, SemaphoreSlimExtensions,
+         SimpleSpinLock, ValueStopWatch, EnsureThreadPool, etc.) are centralized in the core MonoTorrent library
+         (via the ProjectReference + the InternalsVisibleTo attributes in Directory.Build.props).
+         Setting the corresponding Use* flags to false here prevents local linked copies from conflicting (CS0433 dups etc.). -->
+    <UseCache>false</UseCache>
+    <UseEnsureThreadPool>false</UseEnsureThreadPool>
+    <UseIListExtensions>false</UseIListExtensions>
     <UseLogger>true</UseLogger>
-    <UseMainLoop>true</UseMainLoop>
-    <UseSemaphoreSlimExtensions>true</UseSemaphoreSlimExtensions>
-    <UseSimpleSpinLock>true</UseSimpleSpinLock>
-    <UseThreadSwitcher>true</UseThreadSwitcher>
-    <UseTorrentFileExtensions>true</UseTorrentFileExtensions>
-    <UseValueStopWatch>true</UseValueStopWatch>
+    <UseMainLoop>false</UseMainLoop>
+    <UseSemaphoreSlimExtensions>false</UseSemaphoreSlimExtensions>
+    <UseSimpleSpinLock>false</UseSimpleSpinLock>
+    <UseThreadSwitcher>false</UseThreadSwitcher>
+    <UseTorrentFileExtensions>false</UseTorrentFileExtensions>
+    <UseValueStopWatch>false</UseValueStopWatch>
   </PropertyGroup>
 
   <!-- Ensure this library is referenced as a dependency -->
@@ -88,6 +92,7 @@
   <ItemGroup>
     <ProjectReference Include="..\MonoTorrent\MonoTorrent.csproj" PrivateAssets="all" />
     <ProjectReference Include="..\MonoTorrent.BEncoding\MonoTorrent.BEncoding.csproj" PrivateAssets="all" />
+    <ProjectReference Include="..\MonoTorrent.Connections\MonoTorrent.Connections.csproj" PrivateAssets="all" />
     <ProjectReference Include="..\MonoTorrent.Factories\MonoTorrent.Factories.csproj" PrivateAssets="all" />
     <ProjectReference Include="..\MonoTorrent.Messages\MonoTorrent.Messages.csproj" PrivateAssets="all" />
     <ProjectReference Include="..\MonoTorrent.PieceWriter\MonoTorrent.PieceWriter.csproj" PrivateAssets="all" />

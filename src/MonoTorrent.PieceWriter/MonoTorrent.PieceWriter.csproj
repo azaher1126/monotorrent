@@ -5,21 +5,19 @@
   </PropertyGroup>
 
   <PropertyGroup>
-    <UseEnsureThreadPool>true</UseEnsureThreadPool>
-    <UseIListExtensions>true</UseIListExtensions>
+    <!-- Shared internal utilities centralized in core (ProjectRef + IVT). Use*=false to avoid dups like CS0433 for EnsureThreadPool, SpinLocked etc. -->
+    <UseEnsureThreadPool>false</UseEnsureThreadPool>
+    <UseIListExtensions>false</UseIListExtensions>
     <UseSemaphoreSlimExtensions>true</UseSemaphoreSlimExtensions>
-    <UseSimpleSpinLock>true</UseSimpleSpinLock>
-    <UseThreadSwitcher>true</UseThreadSwitcher>
-    <UseTorrentFileExtensions>true</UseTorrentFileExtensions>
+    <UseSimpleSpinLock>false</UseSimpleSpinLock>
+    <UseThreadSwitcher>false</UseThreadSwitcher>
+    <UseTorrentFileExtensions>false</UseTorrentFileExtensions>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="GitInfo" />
     <PackageReference Include="ReusableTasks" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <ProjectReference Include="..\MonoTorrent\MonoTorrent.csproj" />
+    <ProjectReference Include="..\MonoTorrent\MonoTorrent.csproj" PrivateAssets="all" />
   </ItemGroup>
 
 </Project>

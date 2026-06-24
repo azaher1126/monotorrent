@@ -42,8 +42,10 @@ using System.Threading.Tasks;
 using MonoTorrent.BEncoding;
 using MonoTorrent.Client.Listeners;
 using MonoTorrent.Client.RateLimiters;
+using MonoTorrent.Connections;
 using MonoTorrent.Connections.Dht;
 using MonoTorrent.Connections.Peer;
+using MonoTorrent.Connections.Peer.Utp;
 using MonoTorrent.Dht;
 using MonoTorrent.Logging;
 using MonoTorrent.PieceWriter;
@@ -238,6 +240,23 @@ namespace MonoTorrent.Client
         /// </summary>
         public IList<IPeerConnectionListener> PeerListeners { get; private set; } = Array.Empty<IPeerConnectionListener> ();
 
+        /// <summary>
+        /// The uTP socket manager (when uTP is enabled). It does not own UDP sockets; instead ClientEngine
+        /// creates the necessary UDP listeners (on the same ports as the TCP peer listeners for reachability,
+        /// and potentially the DHT port) and attaches them here. This enables full UDP socket sharing between
+        /// uTP and DHT (and any other UDP protocols) on the same port.
+        /// </summary>
+        internal UtpSocketManager? UtpSocketManager { get; private set; }
+
+        /// <summary>
+        /// Number of active uTP connections (for monitoring/stats).
+        /// </summary>
+        public int UtpActiveConnections => UtpSocketManager?.ActiveConnections ?? 0;
+
+        // Dedicated (non-DHT-shared) UDP transports created solely for uTP on peer listen ports.
+        // These must be explicitly Started/Stopped and have their UDP ports port-mapped.
+        List<ISocketMessageListener>? _dedicatedUtpUdpTransports;
+
         internal ILocalPeerDiscovery LocalPeerDiscovery { get; private set; }
 
         /// <summary>
@@ -347,9 +366,91 @@ namespace MonoTorrent.Client
             DhtEngine.PeersFound += DhtEnginePeersFound;
             LocalPeerDiscovery = new NullLocalPeerDiscovery ();
 
+            // === uTP (BEP 29) support with full UDP socket sharing ===
+            // We maintain a list of UDP transports (ISocketMessageListener) that are dedicated to uTP
+            // (i.e. not the main shared DhtListener). These need explicit Start/Stop + UDP port mapping.
+            List<ISocketMessageListener>? dedicatedUtpUdpTransports = null;
+
+            if (settings.EnableUtp) {
+                UtpSocketManager = new UtpSocketManager (settings.UtpTargetDelayMilliseconds);
+                dedicatedUtpUdpTransports = new List<ISocketMessageListener> ();
+
+                // Create UDP transports for the announced peer listen ports (so remote peers can send uTP
+                // to the same port number they see in peer lists / compact / PEX). 
+                // Full sharing: if a port+AF matches the DhtEndPoint listener, we pass the *exact same* 
+                // UdpListener instance to both DhtEngine and UtpSocketManager via AddTransport.
+                var utpListeners = new List<IPeerConnectionListener> ();
+                foreach (var tcpListener in PeerListeners) {
+                    var preferred = tcpListener.PreferredLocalEndPoint;
+                    if (preferred == null)
+                        continue;
+
+                    ISocketMessageListener? udpTransportForUtp;
+
+                    bool sharesWithDht = DhtListener.LocalEndPoint != null &&
+                                         DhtListener.LocalEndPoint.Port == preferred.Port &&
+                                         DhtListener.LocalEndPoint.AddressFamily == preferred.AddressFamily;
+
+                    if (sharesWithDht) {
+                        // Full UDP socket sharing: one socket serves DHT + uTP (and any future UDP protocols).
+                        udpTransportForUtp = DhtListener as ISocketMessageListener;
+                    } else {
+                        // Dedicated UDP listener on the same numeric port as this TCP listener.
+                        // (TCP and UDP can share a port number; only UDP+UDP on exact same endpoint conflicts.)
+                        var dedicated = Factories.CreateDhtListener (preferred) ?? new DhtListener (preferred);
+                        udpTransportForUtp = dedicated as ISocketMessageListener;
+                        if (udpTransportForUtp != null)
+                            dedicatedUtpUdpTransports.Add (udpTransportForUtp);
+                    }
+
+                    if (udpTransportForUtp != null) {
+                        UtpSocketManager.AddTransport (udpTransportForUtp);
+                    }
+
+                    var utpListener = new UtpPeerConnectionListener (preferred, UtpSocketManager);
+                    utpListeners.Add (utpListener);
+                }
+
+                // Append the uTP listeners so ListenManager receives ConnectionReceived for both TCP and uTP.
+                // Incoming uTP flows through exactly the same encryption + BT handshake + PeerId paths as TCP.
+                if (utpListeners.Count > 0) {
+                    var combined = new List<IPeerConnectionListener> (PeerListeners);
+                    combined.AddRange (utpListeners);
+                    PeerListeners = Array.AsReadOnly (combined.ToArray ());
+                    listenManager.SetListeners (PeerListeners);
+                }
+
+                // Register pluggable creators for "utp-ipv*" schemes. ConnectionManager tries these first
+                // for peers learned as normal ipv4/ipv6 URIs. When EnableUtp=false the creators are absent
+                // and we fall back gracefully to TCP.
+                Factories = Factories
+                    .WithPeerConnectionCreator ("utp-ipv4", CreateUtpPeerConnectionFromUri)
+                    .WithPeerConnectionCreator ("utp-ipv6", CreateUtpPeerConnectionFromUri);
+            }
+
+            // Store for use in Start/Stop and settings update paths.
+            _dedicatedUtpUdpTransports = dedicatedUtpUdpTransports;
+
             TrackerAnnounceLimiter = new ReusableSemaphore (15);
 
             RegisterLocalPeerDiscovery (settings.AllowLocalPeerDiscovery ? Factories.CreateLocalPeerDiscovery () : null);
+        }
+
+        IPeerConnection? CreateUtpPeerConnectionFromUri (Uri uri)
+        {
+            if (UtpSocketManager == null)
+                return null;
+
+            if (!IPAddress.TryParse (uri.Host, out var ip))
+                return null;
+
+            try {
+                var ep = new IPEndPoint (ip, uri.Port);
+                var impl = UtpSocketManager.CreateOutgoingConnection (ep);
+                return new UtpPeerConnection (impl);
+            } catch {
+                return null;
+            }
         }
 
         #endregion
@@ -593,6 +694,8 @@ namespace MonoTorrent.Client
                 DhtListener.Stop ();
                 DhtEngine.Dispose ();
 
+                UtpSocketManager?.Dispose ();
+
                 DiskManager.Dispose ();
                 LocalPeerDiscovery.Stop ();
             });
@@ -829,6 +932,19 @@ namespace MonoTorrent.Client
 
                 if (DhtListener.LocalEndPoint != null)
                     await PortForwarder.RegisterMappingAsync (new Mapping (Protocol.Udp, DhtListener.LocalEndPoint.Port));
+
+                // Start dedicated uTP UDP transports (the ones not shared with the main DhtListener)
+                // and register UDP port mappings so that uTP is reachable on the announced peer ports.
+                if (_dedicatedUtpUdpTransports != null) {
+                    foreach (var transport in _dedicatedUtpUdpTransports) {
+                        if (transport is UdpListener ul && ul.Status != ListenerStatus.Listening) {
+                            ul.Start ();
+                        }
+                        if (transport.LocalEndPoint != null && Settings.AllowPortForwarding) {
+                            await PortForwarder.RegisterMappingAsync (new Mapping (Protocol.Udp, transport.LocalEndPoint.Port));
+                        }
+                    }
+                }
             }
         }
 
@@ -850,6 +966,18 @@ namespace MonoTorrent.Client
 
                 if (DhtListener.LocalEndPoint != null)
                     await PortForwarder.UnregisterMappingAsync (new Mapping (Protocol.Udp, DhtListener.LocalEndPoint.Port), CancellationToken.None);
+
+                // Unmap and stop dedicated uTP UDP transports.
+                if (_dedicatedUtpUdpTransports != null) {
+                    foreach (var transport in _dedicatedUtpUdpTransports) {
+                        if (transport.LocalEndPoint != null && Settings.AllowPortForwarding) {
+                            await PortForwarder.UnregisterMappingAsync (new Mapping (Protocol.Udp, transport.LocalEndPoint.Port), CancellationToken.None);
+                        }
+                        if (transport is UdpListener ul) {
+                            ul.Stop ();
+                        }
+                    }
+                }
 
                 LocalPeerDiscovery.Stop ();
 
@@ -1007,6 +1135,64 @@ namespace MonoTorrent.Client
 
                 if (IsRunning)
                     await StartAndPortMapPeerListeners ();
+            }
+
+            // uTP enable / target delay changes or listen port changes require re-initializing the uTP manager + UDP attachments.
+            if (oldSettings.EnableUtp != newSettings.EnableUtp ||
+                oldSettings.UtpTargetDelayMilliseconds != newSettings.UtpTargetDelayMilliseconds ||
+                !oldSettings.ListenEndPoints.SequenceEqual (newSettings.ListenEndPoints) ||
+                oldSettings.DhtEndPoint != newSettings.DhtEndPoint) {
+
+                UtpSocketManager?.Dispose ();
+                UtpSocketManager = null;
+                _dedicatedUtpUdpTransports = null;
+
+                if (newSettings.EnableUtp) {
+                    UtpSocketManager = new UtpSocketManager (newSettings.UtpTargetDelayMilliseconds);
+                    _dedicatedUtpUdpTransports = new List<ISocketMessageListener> ();
+
+                    // Re-attach for current peer ports (polished hot-swap)
+                    var utpLs = new List<IPeerConnectionListener> ();
+                    foreach (var tcpL in PeerListeners.Where(l => !(l is UtpPeerConnectionListener)).ToList()) {
+                        var pref = tcpL.PreferredLocalEndPoint;
+                        if (pref == null) continue;
+
+                        ISocketMessageListener? udpT = null;
+                        bool shareDht = DhtListener.LocalEndPoint != null &&
+                                        DhtListener.LocalEndPoint.Port == pref.Port &&
+                                        DhtListener.LocalEndPoint.AddressFamily == pref.AddressFamily;
+                        if (shareDht) {
+                            udpT = DhtListener as ISocketMessageListener;
+                        } else {
+                            var ded = Factories.CreateDhtListener (pref) ?? new DhtListener (pref);
+                            udpT = ded as ISocketMessageListener;
+                            if (udpT != null) _dedicatedUtpUdpTransports.Add(udpT);
+                        }
+                        if (udpT != null) UtpSocketManager.AddTransport(udpT);
+                        utpLs.Add(new UtpPeerConnectionListener(pref, UtpSocketManager));
+                    }
+                    if (utpLs.Count > 0) {
+                        var comb = new List<IPeerConnectionListener>(PeerListeners.Where(l => !(l is UtpPeerConnectionListener)));
+                        comb.AddRange(utpLs);
+                        PeerListeners = Array.AsReadOnly(comb.ToArray());
+                        listenManager.SetListeners(PeerListeners);
+                    }
+
+                    if (IsRunning && _dedicatedUtpUdpTransports != null)
+                    {
+                        foreach (var transport in _dedicatedUtpUdpTransports)
+                        {
+                            if (transport is UdpListener ul && ul.Status != ListenerStatus.Listening)
+                            {
+                                ul.Start();
+                            }
+                            if (transport.LocalEndPoint != null && Settings.AllowPortForwarding)
+                            {
+                                _ = PortForwarder.RegisterMappingAsync(new Mapping(Protocol.Udp, transport.LocalEndPoint.Port));
+                            }
+                        }
+                    }
+                }
             }
 
             if (oldSettings.AllowLocalPeerDiscovery != newSettings.AllowLocalPeerDiscovery) {

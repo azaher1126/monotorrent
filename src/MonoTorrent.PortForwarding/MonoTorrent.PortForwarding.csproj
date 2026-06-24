@@ -6,13 +6,16 @@
 
   <PropertyGroup>
     <UseSemaphoreSlimExtensions>true</UseSemaphoreSlimExtensions>
-    <UseSimpleSpinLock>true</UseSimpleSpinLock>
-    <UseThreadSwitcher>true</UseThreadSwitcher>
+    <!-- SpinLocked centralized in the core MonoTorrent library (via ProjectReference + InternalsVisibleTo).
+         Setting this false prevents duplicate type definitions across assemblies. --> 
+    <UseSimpleSpinLock>false</UseSimpleSpinLock>
+    <UseThreadSwitcher>false</UseThreadSwitcher>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="GitInfo" />
     <PackageReference Include="Mono.Nat" />
+    <ProjectReference Include="..\MonoTorrent\MonoTorrent.csproj" PrivateAssets="all" />
   </ItemGroup>
 
   <ItemGroup>

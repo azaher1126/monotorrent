@@ -68,6 +68,40 @@
     <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
       <_Parameter1>Benchmark</_Parameter1>
     </AssemblyAttribute>
+
+    <!-- Grant access to the internal SpinLocked<T> (and other shared internals) from the core library
+         to sibling libraries that depend on the core. This prevents the same type definition from being
+         compiled into multiple assemblies (which causes CS0433 when a test project references more than one). -->
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>MonoTorrent.Client</_Parameter1>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>MonoTorrent.Connections</_Parameter1>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>MonoTorrent.Dht</_Parameter1>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>MonoTorrent.Messages</_Parameter1>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>MonoTorrent.PiecePicking</_Parameter1>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>MonoTorrent.PieceWriter</_Parameter1>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>MonoTorrent.PortForwarding</_Parameter1>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>MonoTorrent.Trackers</_Parameter1>
+    </AssemblyAttribute>
+
+    <!-- Explicit grant so that test code (e.g. TempDir.cs which directly uses SpinLocked) in the main test assembly
+         can access the now-centralized internal SpinLocked<T> from the core. -->
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>Tests.MonoTorrent.Client</_Parameter1>
+    </AssemblyAttribute>
   </ItemGroup>
 
 </Project>

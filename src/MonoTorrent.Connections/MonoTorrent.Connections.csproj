@@ -5,8 +5,10 @@
   </PropertyGroup>
 
   <PropertyGroup>
-    <UseSimpleSpinLock>true</UseSimpleSpinLock>
-    <UseThreadSwitcher>true</UseThreadSwitcher>
+    <!-- SpinLocked (and other shared internals) now come from the core MonoTorrent library via InternalsVisibleTo.
+         Do not set UseSimpleSpinLock=true here, or we would duplicate the type definition into this assembly. -->
+    <UseSimpleSpinLock>false</UseSimpleSpinLock>
+    <UseThreadSwitcher>false</UseThreadSwitcher>
   </PropertyGroup>
 
   <ItemGroup>
@@ -15,6 +17,14 @@
 
   <ItemGroup>
     <ProjectReference Include="..\MonoTorrent.Messages\MonoTorrent.Messages.csproj" />
+    <ProjectReference Include="..\MonoTorrent\MonoTorrent.csproj" PrivateAssets="all" />
+  </ItemGroup>
+
+  <!-- Allow test assembly to access internals for uTP unit tests -->
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>Tests.MonoTorrent.Client</_Parameter1>
+    </AssemblyAttribute>
   </ItemGroup>
 
 </Project>

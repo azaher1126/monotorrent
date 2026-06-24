@@ -163,6 +163,26 @@ namespace MonoTorrent.Client
         public IPEndPoint? DhtEndPoint { get; } = new IPEndPoint (IPAddress.Any, 0);
 
         /// <summary>
+        /// If true, the engine will listen for and initiate uTP (micro Transport Protocol, BEP 29) connections
+        /// in addition to regular TCP connections. uTP provides delay-based congestion control (LEDBAT) which
+        /// yields to other traffic on the link. When enabled, the engine will create UDP listeners on the same
+        /// ports as the TCP peer listeners (and share the UDP socket with DHT if their ports coincide) to ensure
+        /// uTP connections can be established to the announced peer endpoint.
+        /// Defaults to <see langword="true"/>.
+        /// </summary>
+        public bool EnableUtp { get; } = true;
+
+        /// <summary>
+        /// The target one-way delay (in milliseconds) that the uTP LEDBAT congestion controller will try to
+        /// maintain under load. Lower values make uTP more aggressive at yielding bandwidth to other applications.
+        /// libtorrent uses 75ms; uTorrent historically used ~100ms. The LEDBAT algorithm adjusts the congestion
+        /// window based on measured one-way delays relative to this target.
+        /// Only applies when <see cref="EnableUtp"/> is true.
+        /// Defaults to 75.
+        /// </summary>
+        public int UtpTargetDelayMilliseconds { get; } = 75;
+
+        /// <summary>
         /// This is the full path to a sub-directory of <see cref="CacheDirectory"/>. If <see cref="AutoSaveLoadFastResume"/>
         /// is enabled then fast resume data will be written to this when <see cref="TorrentManager.StopAsync"/> or
         /// <see cref="ClientEngine.StopAllAsync"/> is invoked. If fast resume data is available, the data will be loaded

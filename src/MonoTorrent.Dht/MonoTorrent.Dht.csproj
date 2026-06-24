@@ -9,7 +9,9 @@
     <UseCache>true</UseCache>
     <UseEnsureThreadPool>true</UseEnsureThreadPool>
     <UseMainLoop>true</UseMainLoop>
-    <UseSimpleSpinLock>true</UseSimpleSpinLock>
+    <!-- SpinLocked centralized in the core MonoTorrent library (via ProjectReference + InternalsVisibleTo).
+         Do not enable UseSimpleSpinLock here to avoid duplicate type definition when tests reference multiple assemblies. -->
+    <UseSimpleSpinLock>false</UseSimpleSpinLock>
     <UseThreadSwitcher>true</UseThreadSwitcher>
     <UseValueStopWatch>true</UseValueStopWatch>
   </PropertyGroup>
@@ -20,6 +22,7 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\MonoTorrent.Messages\MonoTorrent.Messages.csproj" />
+    <ProjectReference Include="..\MonoTorrent\MonoTorrent.csproj" PrivateAssets="all" />
   </ItemGroup>
 
 </Project>
