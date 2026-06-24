@@ -120,8 +120,6 @@ namespace MonoTorrent.Connections.Peer.Utp
         private uint _advWnd = 64 * 1024;
         private int _ssthres;
         private bool _slowStart = true;
-        private bool _cwndFull;
-
         private ushort _mtu = 1500;
         private ushort _mtuFloor = 576;
         private ushort _mtuCeiling = 1500;
@@ -132,9 +130,6 @@ namespace MonoTorrent.Connections.Peer.Utp
         private int _delaySampleIdx;
 
         private uint _replyMicro;
-        private int _sendDelay;
-        private int _recvDelay;
-
         private DateTimeOffset _timeout;
         private DateTimeOffset _lastSent;
         private int _numTimeouts;
@@ -155,8 +150,9 @@ namespace MonoTorrent.Connections.Peer.Utp
 
         private readonly Queue<byte[]> _receiveBuffer = new Queue<byte[]>();
         private readonly Queue<ReusableTaskCompletionSource<int>> _pendingReceives = new Queue<ReusableTaskCompletionSource<int>>();
+        // Paired with _pendingReceives: buffers supplied by waiting ReceiveAsync callers.
+        private readonly Queue<Memory<byte>> _pendingReceiveBuffers = new Queue<Memory<byte>>();
         private int _receiveBufferSize;
-        private int _receiveBufferCapacity = 1024 * 1024;
         private bool _inEof;
         private ushort _inEofSeqNr;
 
@@ -231,8 +227,11 @@ namespace MonoTorrent.Connections.Peer.Utp
             while (_pendingReceives.Count > 0)
             {
                 var tcs = _pendingReceives.Dequeue();
+                if (_pendingReceiveBuffers.Count > 0)
+                    _pendingReceiveBuffers.Dequeue();
                 tcs.SetException(_error ?? new System.IO.IOException("uTP closed"));
             }
+            _pendingReceiveBuffers.Clear();
         }
 
         internal void SendSyn()
@@ -301,21 +300,28 @@ namespace MonoTorrent.Connections.Peer.Utp
                 SetState (UtpState.Connected);
             }
 
-            bool sof = ph.PacketType == UtpPacketType.ST_STATE || ph.PacketType == UtpPacketType.ST_FIN;
-            ushort cmp = ((_state == UtpState.SynSent || _state == UtpState.FinSent || _state == UtpState.Deleting) && sof) ? _seqNr : (ushort)((_seqNr - 1) & UtpConstants.AckMask);
+            // Highest seq we may have placed on the wire. DATA/SYN/FIN increment _seqNr after send, so their
+            // highest sent is (_seqNr - 1). STATE/RESET reuse the current _seqNr without incrementing, so the
+            // peer may legitimately ack_nr == _seqNr. Allow both by accepting ack_nr up through _seqNr.
+            ushort maxSendableAck = _seqNr;
 
             // Skip strict ack validation only while still in pre-connected states for SYN (already handled above).
+            // Only reject acks that are strictly beyond anything we could have sent (upper bound).
+            // Do NOT apply a circular lower-bound against _ackedSeqNr: on the passive side _ackedSeqNr starts
+            // from the peer's SYN ack field (often 0) while the peer's first DATA ack_nr equals our STATE
+            // seq_nr (random, often large). A wrap-aware "ack went backwards" check falsely drops those packets.
             bool skipAckCheck = (_state == UtpState.Connected && ph.PacketType == UtpPacketType.ST_SYN) ||
                                 (ph.PacketType == UtpPacketType.ST_SYN && _isIncoming);
             if (!skipAckCheck && (_state != UtpState.None || ph.PacketType != UtpPacketType.ST_SYN) &&
-                (CompareLessWrap(cmp, ph.AckNr, UtpConstants.AckMask) || CompareLessWrap(ph.AckNr, (ushort)(_ackedSeqNr - 3), UtpConstants.AckMask)))
+                CompareLessWrap (maxSendableAck, ph.AckNr, UtpConstants.AckMask))
                 return;
 
+            bool sof = ph.PacketType == UtpPacketType.ST_STATE || ph.PacketType == UtpPacketType.ST_FIN;
             if (_inEof && CompareLessWrap(_inEofSeqNr, ph.SeqNr, UtpConstants.AckMask) && !(_inEofSeqNr == ph.SeqNr && sof)) return;
 
             if (ph.PacketType == UtpPacketType.ST_RESET)
             {
-                if (CompareLessWrap(cmp, ph.AckNr, UtpConstants.AckMask)) return;
+                if (CompareLessWrap(maxSendableAck, ph.AckNr, UtpConstants.AckMask)) return;
                 _error = new System.IO.IOException("uTP reset");
                 SetState(UtpState.ErrorWait);
                 _manager.UnregisterConnection(this);
@@ -396,29 +402,41 @@ namespace MonoTorrent.Connections.Peer.Utp
             int hsz = p;
             int psz = buf.Length - hsz;
 
+            // BEP29: _ackNr is the last contiguous sequence number we have fully received/acknowledged.
+            // The next in-order DATA/FIN must carry seq_nr == (_ackNr + 1).
+            ushort nextExpected = (ushort) ((_ackNr + 1) & UtpConstants.AckMask);
+
             if (ph.PacketType == UtpPacketType.ST_FIN)
             {
-                ushort exf = (ushort)((_ackNr + 1) & UtpConstants.AckMask);
-                if (ph.SeqNr == exf || ph.SeqNr == _ackNr) _ackNr = ph.SeqNr;
-                if (!_inEof) { _inEof = true; _inEofSeqNr = (ushort)((ph.SeqNr + (psz > 0 ? 1u : 0u)) & UtpConstants.AckMask); }
+                if (ph.SeqNr == nextExpected || ph.SeqNr == _ackNr) {
+                    if (ph.SeqNr == nextExpected)
+                        _ackNr = ph.SeqNr;
+                }
+                if (!_inEof) {
+                    _inEof = true;
+                    _inEofSeqNr = (ushort) ((ph.SeqNr + (psz > 0 ? 1u : 0u)) & UtpConstants.AckMask);
+                }
             }
 
             if (psz > 0 && (ph.PacketType == UtpPacketType.ST_DATA || ph.PacketType == UtpPacketType.ST_FIN))
             {
-                ushort ex = (ushort)(_ackNr & UtpConstants.AckMask);
-                if (ph.SeqNr == ex)
+                if (ph.SeqNr == nextExpected)
                 {
                     byte[] py = buf.Slice(hsz, psz).ToArray();
                     EnqueueReceivedData(py);
-                    _ackNr = (ushort)((_ackNr + 1) & UtpConstants.AckMask);
+                    _ackNr = ph.SeqNr;
                     DeliverContiguousIncoming();
                 }
-                else if (!CompareLessWrap(ph.SeqNr, _ackNr, UtpConstants.AckMask) && CompareLessWrap(ph.SeqNr, (ushort)(_ackNr + 32), UtpConstants.AckMask))
+                else if (!CompareLessWrap(ph.SeqNr, _ackNr, UtpConstants.AckMask) &&
+                         CompareLessWrap(ph.SeqNr, (ushort)((_ackNr + 32) & UtpConstants.AckMask), UtpConstants.AckMask) &&
+                         !_inbuf.ContainsKey(ph.SeqNr))
                 {
-                    var opkt = _manager.AcquirePacket(psz);
+                    // Store exact payload for later in-order delivery from the reordering buffer.
+                    var exact = buf.Slice(hsz, psz).ToArray();
+                    var opkt = _manager.AcquirePacket(exact.Length);
                     opkt.HeaderSize = 0;
                     opkt.SeqNr = ph.SeqNr;
-                    buf.Slice(hsz, psz).CopyTo(opkt.Data);
+                    opkt.Data = exact;
                     _inbuf[ph.SeqNr] = opkt;
                 }
             }
@@ -530,7 +548,6 @@ namespace MonoTorrent.Connections.Peer.Utp
             else gn = 0;
             if (gn > long.MaxValue - _cwnd) gn = long.MaxValue - _cwnd - 1;
             _cwnd = ((_cwnd + gn) >> 16 < _mtu) ? (long)_mtu << 16 : _cwnd + gn;
-            if (Math.Min((int)(_cwnd >> 16), (int)_advWnd) - inf + ab >= _mtu) _cwndFull = false;
         }
 
         internal void SendData(ReadOnlyMemory<byte> d)
@@ -538,11 +555,12 @@ namespace MonoTorrent.Connections.Peer.Utp
             if (_state != UtpState.Connected && _state != UtpState.FinSent) return;
             if (d.Length == 0) return;
 
-            // Basic Nagle: hold small writes only when data is already in-flight (avoids delaying the first write).
+            // Minimal Nagle: only coalesce when we already have a held incomplete segment.
+            // Do not hold the first application write just because control/probe packets are in-flight
+            // (that stalled small payloads after handshake when an MTU probe was outstanding).
             const int nagleSize = 1400;
-            if (d.Length < 500 && _bytesInFlight > 0 && _naglePacket != null && _naglePacket.PayloadSize + d.Length < nagleSize)
+            if (d.Length < 500 && _naglePacket != null && _naglePacket.Data.Length + d.Length < nagleSize)
             {
-                // append to current nagle packet
                 var combined = new byte[_naglePacket.Data.Length + d.Length];
                 Buffer.BlockCopy(_naglePacket.Data, 0, combined, 0, _naglePacket.Data.Length);
                 d.Span.CopyTo(combined.AsSpan(_naglePacket.Data.Length));
@@ -552,19 +570,9 @@ namespace MonoTorrent.Connections.Peer.Utp
 
             if (_naglePacket != null)
             {
-                // flush previous held nagle
-                _sendQueue.Enqueue(new ReadOnlyMemory<byte>(_naglePacket.Data));
+                _sendQueue.Enqueue(_naglePacket.Data);
                 _manager.ReleasePacket(_naglePacket);
                 _naglePacket = null;
-            }
-
-            // Only hold small writes when something is already in-flight (Nagle); otherwise send immediately.
-            if (d.Length < 500 && _bytesInFlight > 0)
-            {
-                _naglePacket = _manager.AcquirePacket(d.Length + UtpConstants.HeaderSize);
-                _naglePacket.Data = d.ToArray();
-                _naglePacket.HeaderSize = 0;
-                return;
             }
 
             _sendQueue.Enqueue(d);
@@ -595,25 +603,36 @@ namespace MonoTorrent.Connections.Peer.Utp
                 _naglePacket = null;
             }
 
-            // Occasional MTU probe (production: binary search style, detect loss of probe to lower ceiling)
-            if (_mtu < _mtuCeiling && _bytesInFlight < (_cwnd >> 16) && (_mtuProbesSent % 8 == 0))
+            // Occasional MTU probe (only when enabled and we have real user data to send; probes are ST_DATA
+            // segments and would otherwise interleave padding into the application stream).
+            if (_config.AllowDynamicMtu &&
+                _sendQueue.Count > 0 &&
+                _mtu < _mtuCeiling &&
+                _bytesInFlight < (_cwnd >> 16) &&
+                _mtuProbesSent > 0 &&
+                (_mtuProbesSent % 16 == 0))
             {
                 int probePayload = Math.Min(200, _mtuCeiling - _mtu);
-                var pk = _manager.AcquirePacket(UtpConstants.HeaderSize + probePayload);
-                pk.HeaderSize = UtpConstants.HeaderSize;
-                pk.SendTime = DateTimeOffset.UtcNow;
-                pk.NumTransmissions = 1;
-                pk.SeqNr = _seqNr;
-                pk.MtuProbe = true;
-                _mtuSeq = _seqNr;
-                var h = new UtpHeader((byte)((byte)UtpPacketType.ST_DATA << 4 | UtpConstants.Version), UtpConstants.NoExtension, SendId, CurrentMicroTimestamp(), _replyMicro, (ushort)Math.Min(0xFFFF, _advWnd), _seqNr, _ackNr);
-                h.WriteTo(pk.Data);
-                _outbuf[_seqNr] = pk;
-                _seqNr = (ushort)((_seqNr + 1) & UtpConstants.AckMask);
-                _bytesInFlight += probePayload;
-                _lastSent = DateTimeOffset.UtcNow;
-                _manager.Send(pk.Data, new CompactEndPoint(_remoteEndPoint.Address, _remoteEndPoint.Port));
-                _mtuProbesSent++;
+                if (probePayload > 0) {
+                    var pk = _manager.AcquirePacket(UtpConstants.HeaderSize + probePayload);
+                    pk.HeaderSize = UtpConstants.HeaderSize;
+                    pk.SendTime = DateTimeOffset.UtcNow;
+                    pk.NumTransmissions = 1;
+                    pk.SeqNr = _seqNr;
+                    pk.MtuProbe = true;
+                    _mtuSeq = _seqNr;
+                    var h = new UtpHeader((byte)((byte)UtpPacketType.ST_DATA << 4 | UtpConstants.Version), UtpConstants.NoExtension, SendId, CurrentMicroTimestamp(), _replyMicro, (ushort)Math.Min(0xFFFF, _advWnd), _seqNr, _ackNr);
+                    h.WriteTo(pk.Data);
+                    _outbuf[_seqNr] = pk;
+                    _seqNr = (ushort)((_seqNr + 1) & UtpConstants.AckMask);
+                    _bytesInFlight += probePayload;
+                    _lastSent = DateTimeOffset.UtcNow;
+                    _manager.Send(pk.Data, new CompactEndPoint(_remoteEndPoint.Address, _remoteEndPoint.Port));
+                    _mtuProbesSent++;
+                }
+            } else if (_config.AllowDynamicMtu && _sendQueue.Count > 0 && _mtuProbesSent == 0) {
+                // Count sends without injecting a probe on the very first data segment.
+                _mtuProbesSent = 1;
             }
 
             while (_sendQueue.Count > 0 && _bytesInFlight < (_cwnd >> 16))
@@ -650,7 +669,7 @@ namespace MonoTorrent.Connections.Peer.Utp
         {
             bool hasSack = _inbuf.Count > 0;
             int sackBytes = 0;
-            byte[] sackData = null;
+            byte[]? sackData = null;
             if (hasSack)
             {
                 // Compute needed SACK size based on max OOO gap
@@ -681,7 +700,7 @@ namespace MonoTorrent.Connections.Peer.Utp
             int off = 0;
             h.WriteTo(pkt.AsSpan(off, UtpConstants.HeaderSize));
             off += UtpConstants.HeaderSize;
-            if (hasSack)
+            if (hasSack && sackData != null)
             {
                 pkt[off++] = 0; // end ext
                 pkt[off++] = (byte)sackBytes;
@@ -747,25 +766,50 @@ namespace MonoTorrent.Connections.Peer.Utp
 
         private void EnqueueReceivedData(byte[] d)
         {
-            if (d.Length == 0) return;
+            if (d == null || d.Length == 0) return;
             _receiveBuffer.Enqueue(d);
             _receiveBufferSize += d.Length;
+            TryCompletePendingReceives();
+        }
+
+        private void TryCompletePendingReceives()
+        {
             while (_pendingReceives.Count > 0 && _receiveBuffer.Count > 0)
             {
                 var t = _pendingReceives.Dequeue();
+                var dest = _pendingReceiveBuffers.Count > 0 ? _pendingReceiveBuffers.Dequeue() : default;
                 var c = _receiveBuffer.Dequeue();
                 _receiveBufferSize -= c.Length;
-                t.SetResult(c.Length);
+                if (dest.Length > 0) {
+                    int n = Math.Min(dest.Length, c.Length);
+                    c.AsSpan(0, n).CopyTo(dest.Span);
+                    if (n < c.Length) {
+                        var r = new byte[c.Length - n];
+                        Array.Copy(c, n, r, 0, r.Length);
+                        _receiveBuffer.Enqueue(r);
+                        _receiveBufferSize += r.Length;
+                    }
+                    t.SetResult(n);
+                } else {
+                    // No caller buffer was recorded (should not happen in normal flow); report full length.
+                    t.SetResult(c.Length);
+                }
             }
         }
 
         private void DeliverContiguousIncoming()
         {
-            while (_inbuf.TryGetValue((ushort)(_ackNr & UtpConstants.AckMask), out var op))
+            // Drain in-order segments from the reordering buffer (keys are absolute seq numbers).
+            while (true)
             {
-                _inbuf.Remove((ushort)(_ackNr & UtpConstants.AckMask));
+                ushort next = (ushort) ((_ackNr + 1) & UtpConstants.AckMask);
+                if (!_inbuf.TryGetValue(next, out var op))
+                    break;
+                _inbuf.Remove(next);
+                // Payload only (HeaderSize == 0); use full stored array.
                 EnqueueReceivedData(op.Data);
-                _ackNr = (ushort)((_ackNr + 1) & UtpConstants.AckMask);
+                _manager.ReleasePacket(op);
+                _ackNr = next;
             }
         }
 
@@ -804,21 +848,36 @@ namespace MonoTorrent.Connections.Peer.Utp
 
         internal ReusableTask<int> ReceiveAsync(Memory<byte> b)
         {
+            if (b.Length == 0)
+                return ReusableTask.FromResult(0);
+
             if (_receiveBuffer.Count > 0)
             {
                 var s = _receiveBuffer.Dequeue();
                 int n = Math.Min(b.Length, s.Length);
                 s.AsSpan(0, n).CopyTo(b.Span);
-                if (n < s.Length) { var r = new byte[s.Length - n]; Array.Copy(s, n, r, 0, r.Length); _receiveBuffer.Enqueue(r); _receiveBufferSize += r.Length; }
-                _receiveBufferSize -= n;
+                if (n < s.Length) {
+                    var r = new byte[s.Length - n];
+                    Array.Copy(s, n, r, 0, r.Length);
+                    _receiveBuffer.Enqueue(r);
+                    _receiveBufferSize += r.Length;
+                }
+                _receiveBufferSize -= s.Length;
                 return ReusableTask.FromResult(n);
             }
             if (_inEof && _receiveBuffer.Count == 0)
             {
                 return ReusableTask.FromResult(0);
             }
-            if (_state == UtpState.ErrorWait || _state == UtpState.Deleting || _error != null) { var t = new ReusableTaskCompletionSource<int>(); t.SetException(_error ?? new System.IO.IOException("uTP closed")); return t.Task; }
-            var w = new ReusableTaskCompletionSource<int>(); _pendingReceives.Enqueue(w); return w.Task;
+            if (_state == UtpState.ErrorWait || _state == UtpState.Deleting || _error != null) {
+                var t = new ReusableTaskCompletionSource<int>();
+                t.SetException(_error ?? new System.IO.IOException("uTP closed"));
+                return t.Task;
+            }
+            var w = new ReusableTaskCompletionSource<int>();
+            _pendingReceives.Enqueue(w);
+            _pendingReceiveBuffers.Enqueue(b);
+            return w.Task;
         }
 
         internal ReusableTask<int> SendAsync(ReadOnlyMemory<byte> b)

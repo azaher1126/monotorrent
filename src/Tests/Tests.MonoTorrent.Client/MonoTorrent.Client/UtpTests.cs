@@ -15,6 +15,7 @@ using System.Net;
 using System.Threading.Tasks;
 
 using MonoTorrent.Connections;
+using MonoTorrent.Connections.Peer;
 using MonoTorrent.Connections.Peer.Utp;
 
 using NUnit.Framework;
@@ -310,6 +311,304 @@ namespace MonoTorrent.Client
             bool ok = await peer.ConnectAsync ().ConfigureAwait (false);
             Assert.IsTrue (ok);
             Assert.AreEqual (UtpState.Connected, impl.State);
+        }
+
+        static byte[] BuildUtpPacket (byte type, ushort connId, ushort seqNr, ushort ackNr, ushort wnd, ReadOnlySpan<byte> payload)
+        {
+            var pkt = new byte[20 + payload.Length];
+            pkt[0] = (byte) ((type << 4) | 1);
+            pkt[1] = 0;
+            pkt[2] = (byte) (connId >> 8);
+            pkt[3] = (byte) (connId & 0xFF);
+            // timestamps / wnd / seq / ack
+            pkt[12] = (byte) (wnd >> 8);
+            pkt[13] = (byte) (wnd & 0xFF);
+            pkt[14] = (byte) (seqNr >> 8);
+            pkt[15] = (byte) (seqNr & 0xFF);
+            pkt[16] = (byte) (ackNr >> 8);
+            pkt[17] = (byte) (ackNr & 0xFF);
+            if (payload.Length > 0)
+                payload.CopyTo (pkt.AsSpan (20));
+            return pkt;
+        }
+
+        /// <summary>
+        /// Delivers only ST_DATA segments from <paramref name="from"/> to <paramref name="to"/> starting at <paramref name="startIndex"/>.
+        /// </summary>
+        static int DeliverDataPackets (MockTransport from, MockTransport to, CompactEndPoint fromEp, int startIndex)
+        {
+            int delivered = 0;
+            for (int i = startIndex; i < from.SentPackets.Count; i++) {
+                if (WireType (from.SentPackets[i].Data) == TypeData) {
+                    to.SimulateReceive (from.SentPackets[i].Data, fromEp);
+                    delivered++;
+                }
+            }
+            return delivered;
+        }
+
+        static (UtpConnection initiator, UtpPeerConnection passivePeer, MockTransport tA, MockTransport tB, UtpSocketManager mA, UtpSocketManager mB)
+            SetupHandshakePair (int portA, int portB)
+        {
+            var tA = new MockTransport (portA);
+            var tB = new MockTransport (portB);
+            tA.Start ();
+            tB.Start ();
+            var mA = new UtpSocketManager (new UtpConfig { TickInterval = TimeSpan.FromHours (1), AllowDynamicMtu = false });
+            var mB = new UtpSocketManager (new UtpConfig { TickInterval = TimeSpan.FromHours (1), AllowDynamicMtu = false });
+            mA.AddTransport (tA);
+            mB.AddTransport (tB);
+
+            UtpPeerConnection passivePeer = null;
+            var listener = new UtpPeerConnectionListener (new IPEndPoint (IPAddress.Loopback, portB), mB);
+            listener.ConnectionReceived += (_, e) => passivePeer = (UtpPeerConnection) e.Connection;
+            listener.Start ();
+
+            var initiator = PerformHandshake (mA, tA, mB, tB, portB);
+            Assert.IsNotNull (passivePeer, "passive peer must be established via listener");
+            return (initiator, passivePeer, tA, tB, mA, mB);
+        }
+
+        [Test]
+        public void UtpHeader_RoundTrip_PreservesFields ()
+        {
+            // Header parse/write is internal; validate via wire SYN bytes from manager.
+            var transport = new MockTransport (5040);
+            transport.Start ();
+            using var manager = new UtpSocketManager (new UtpConfig { TickInterval = TimeSpan.FromHours (1) });
+            manager.AddTransport (transport);
+
+            manager.CreateOutgoingConnection (new IPEndPoint (IPAddress.Loopback, 9000));
+            var pkt = transport.SentPackets[0].Data;
+
+            Assert.AreEqual (1, WireVersion (pkt));
+            Assert.AreEqual (TypeSyn, WireType (pkt));
+            Assert.AreEqual (20, pkt.Length); // SYN has no payload
+            Assert.AreEqual (0, pkt[1]); // no extension
+        }
+
+        [Test]
+        public async Task Handshake_ThenSendData_EmitsDataPacket_Strict ()
+        {
+            var tA = new MockTransport (5041);
+            var tB = new MockTransport (5042);
+            tA.Start ();
+            tB.Start ();
+
+            using var mA = new UtpSocketManager (new UtpConfig { TickInterval = TimeSpan.FromHours (1) });
+            using var mB = new UtpSocketManager (new UtpConfig { TickInterval = TimeSpan.FromHours (1) });
+            mA.AddTransport (tA);
+            mB.AddTransport (tB);
+
+            var connA = PerformHandshake (mA, tA, mB, tB, 5042);
+            using var peerA = new UtpPeerConnection (connA);
+            var payload = new byte[600];
+            for (int i = 0; i < payload.Length; i++)
+                payload[i] = (byte) (i & 0xFF);
+
+            int sentBefore = tA.SentPackets.Count;
+            int sent = await peerA.SendAsync (payload).ConfigureAwait (false);
+            Assert.AreEqual (payload.Length, sent);
+            Assert.Greater (tA.SentPackets.Count, sentBefore, "DATA should be emitted on the wire");
+
+            bool sawData = false;
+            for (int i = sentBefore; i < tA.SentPackets.Count; i++) {
+                if (WireType (tA.SentPackets[i].Data) == TypeData && tA.SentPackets[i].Data.Length > 20) {
+                    sawData = true;
+                    // Payload should follow the 20-byte header.
+                    CollectionAssert.AreEqual (payload, tA.SentPackets[i].Data.AsSpan (20).ToArray ());
+                }
+            }
+            Assert.IsTrue (sawData, "expected ST_DATA with payload");
+        }
+
+        [Test]
+        public async Task PassiveSide_ReceivesData_AfterHandshake ()
+        {
+            var (connA, passivePeer, tA, tB, mA, mB) = SetupHandshakePair (5051, 5052);
+            using (mA)
+            using (mB) {
+                using var peerA = new UtpPeerConnection (connA);
+                var payload = new byte[] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+                int sentBefore = tA.SentPackets.Count;
+                await peerA.SendAsync (payload).ConfigureAwait (false);
+                Assert.Greater (tA.SentPackets.Count, sentBefore);
+
+                var fromA = new CompactEndPoint (IPAddress.Loopback, tA.LocalEndPoint.Port > 0 ? tA.LocalEndPoint.Port : 1);
+                int stateBeforeB = tB.SentPackets.Count;
+                Assert.Greater (DeliverDataPackets (tA, tB, fromA, sentBefore), 0, "at least one DATA segment should be delivered");
+
+                var recvBuf = new byte[64];
+                var recvTask = passivePeer.ReceiveAsync (recvBuf).AsTask ();
+                if (!recvTask.Wait (TimeSpan.FromSeconds (2)))
+                    Assert.Fail ("ReceiveAsync timed out — passive did not get DATA");
+                int n = recvTask.Result;
+                Assert.AreEqual (payload.Length, n);
+                CollectionAssert.AreEqual (payload, recvBuf.AsSpan (0, n).ToArray ());
+                Assert.GreaterOrEqual (tB.SentPackets.Count, stateBeforeB);
+            }
+        }
+
+        [Test]
+        public async Task PendingReceive_CompletesWhenDataArrives ()
+        {
+            var (connA, passivePeer, tA, tB, mA, mB) = SetupHandshakePair (5061, 5062);
+            using (mA)
+            using (mB) {
+                var recvBuf = new byte[32];
+                var recvTask = passivePeer.ReceiveAsync (recvBuf).AsTask ();
+                Assert.IsFalse (recvTask.IsCompleted, "receive should pend until DATA arrives");
+
+                using var peerA = new UtpPeerConnection (connA);
+                var payload = new byte[] { 0xAA, 0xBB, 0xCC, 0xDD };
+                int sentBefore = tA.SentPackets.Count;
+                await peerA.SendAsync (payload).ConfigureAwait (false);
+
+                var fromA = new CompactEndPoint (IPAddress.Loopback, tA.LocalEndPoint.Port > 0 ? tA.LocalEndPoint.Port : 1);
+                Assert.Greater (DeliverDataPackets (tA, tB, fromA, sentBefore), 0);
+
+                if (!recvTask.Wait (TimeSpan.FromSeconds (2)))
+                    Assert.Fail ("pending ReceiveAsync did not complete");
+                int n = recvTask.Result;
+                Assert.AreEqual (payload.Length, n);
+                CollectionAssert.AreEqual (payload, recvBuf.AsSpan (0, n).ToArray ());
+            }
+        }
+
+        [Test]
+        public void UnknownNonSyn_SendsReset ()
+        {
+            var transport = new MockTransport (5070);
+            transport.Start ();
+            using var manager = new UtpSocketManager (new UtpConfig { TickInterval = TimeSpan.FromHours (1) });
+            manager.AddTransport (transport);
+
+            var state = BuildUtpPacket (TypeState, connId: 0x1234, seqNr: 10, ackNr: 5, wnd: 1024, payload: ReadOnlySpan<byte>.Empty);
+            transport.SimulateReceive (state, new CompactEndPoint (IPAddress.Loopback, 88));
+
+            Assert.AreEqual (0, manager.ActiveConnections);
+            // Production hardening: respond with RESET for unknown non-SYN.
+            Assert.GreaterOrEqual (transport.SentPackets.Count, 1);
+            Assert.AreEqual (TypeReset, WireType (transport.SentPackets[0].Data));
+        }
+
+        [Test]
+        public void UtpPeerConnectionListener_RaisesConnectionReceived_OnIncomingSyn ()
+        {
+            var tA = new MockTransport (5081);
+            var tB = new MockTransport (5082);
+            tA.Start ();
+            tB.Start ();
+
+            using var mA = new UtpSocketManager (new UtpConfig { TickInterval = TimeSpan.FromHours (1) });
+            using var mB = new UtpSocketManager (new UtpConfig { TickInterval = TimeSpan.FromHours (1) });
+            mA.AddTransport (tA);
+            mB.AddTransport (tB);
+
+            int events = 0;
+            IPeerConnection received = null;
+            var listener = new UtpPeerConnectionListener (new IPEndPoint (IPAddress.Loopback, 5082), mB);
+            listener.ConnectionReceived += (_, e) => { events++; received = e.Connection; };
+            listener.Start ();
+            Assert.AreEqual (ListenerStatus.Listening, listener.Status);
+
+            PerformHandshake (mA, tA, mB, tB, 5082);
+            Assert.AreEqual (1, events);
+            Assert.IsNotNull (received);
+            Assert.IsInstanceOf<UtpPeerConnection> (received);
+            Assert.IsTrue (received.IsIncoming);
+        }
+
+        [Test]
+        public async Task SendAsync_WhenNotConnected_Throws ()
+        {
+            var transport = new MockTransport (5090);
+            transport.Start ();
+            using var manager = new UtpSocketManager (new UtpConfig { TickInterval = TimeSpan.FromHours (1) });
+            manager.AddTransport (transport);
+
+            var impl = manager.CreateOutgoingConnection (new IPEndPoint (IPAddress.Loopback, 1));
+            using var peer = new UtpPeerConnection (impl);
+            // Still in SynSent — not fully connected.
+            Assert.AreEqual (UtpState.SynSent, impl.State);
+
+            try {
+                await peer.SendAsync (new byte[] { 1, 2, 3 }).ConfigureAwait (false);
+                Assert.Fail ("expected InvalidOperationException");
+            } catch (InvalidOperationException) {
+                // expected
+            }
+        }
+
+        [Test]
+        public void Abort_DrainsConnectionFromManager ()
+        {
+            var transport = new MockTransport (5091);
+            transport.Start ();
+            using var manager = new UtpSocketManager (new UtpConfig { TickInterval = TimeSpan.FromHours (1) });
+            manager.AddTransport (transport);
+
+            var impl = manager.CreateOutgoingConnection (new IPEndPoint (IPAddress.Loopback, 1));
+            Assert.GreaterOrEqual (manager.ActiveConnections, 1);
+            impl.Abort ();
+            Assert.AreEqual (UtpState.Deleting, impl.State);
+            Assert.AreEqual (0, manager.ActiveConnections);
+        }
+
+        [Test]
+        public void AddTransport_Null_ThrowsArgumentNullException ()
+        {
+            using var manager = new UtpSocketManager (new UtpConfig { TickInterval = TimeSpan.FromHours (1) });
+            Assert.Throws<ArgumentNullException> (() => manager.AddTransport (null));
+        }
+
+        [Test]
+        public void CreateOutgoing_NullEndpoint_ThrowsArgumentNullException ()
+        {
+            using var manager = new UtpSocketManager (new UtpConfig { TickInterval = TimeSpan.FromHours (1) });
+            Assert.Throws<ArgumentNullException> (() => manager.CreateOutgoingConnection (null));
+        }
+
+        [Test]
+        public void UtpPeerConnection_NullImpl_ThrowsArgumentNullException ()
+        {
+            Assert.Throws<ArgumentNullException> (() => new UtpPeerConnection (null));
+        }
+
+        [Test]
+        public async Task ReceiveAsync_PartialBuffer_LeavesRemainder ()
+        {
+            var (connA, passivePeer, tA, tB, mA, mB) = SetupHandshakePair (5101, 5102);
+            using (mA)
+            using (mB) {
+                using var peerA = new UtpPeerConnection (connA);
+                var payload = new byte[] { 10, 20, 30, 40, 50 };
+                int sentBefore = tA.SentPackets.Count;
+                await peerA.SendAsync (payload).ConfigureAwait (false);
+                Assert.Greater (tA.SentPackets.Count, sentBefore, "initiator must emit DATA");
+
+                var fromA = new CompactEndPoint (IPAddress.Loopback, tA.LocalEndPoint.Port > 0 ? tA.LocalEndPoint.Port : 1);
+                Assert.Greater (DeliverDataPackets (tA, tB, fromA, sentBefore), 0);
+
+                var small = new byte[2];
+                var r1 = passivePeer.ReceiveAsync (small).AsTask ();
+                if (!r1.Wait (TimeSpan.FromSeconds (2)))
+                    Assert.Fail ("first partial receive timed out");
+                int n1 = r1.Result;
+                Assert.AreEqual (2, n1);
+                Assert.AreEqual (10, small[0]);
+                Assert.AreEqual (20, small[1]);
+
+                var rest = new byte[8];
+                var r2 = passivePeer.ReceiveAsync (rest).AsTask ();
+                if (!r2.Wait (TimeSpan.FromSeconds (2)))
+                    Assert.Fail ("remainder receive timed out");
+                int n2 = r2.Result;
+                Assert.AreEqual (3, n2);
+                Assert.AreEqual (30, rest[0]);
+                Assert.AreEqual (40, rest[1]);
+                Assert.AreEqual (50, rest[2]);
+            }
         }
     }
 }

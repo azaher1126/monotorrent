@@ -232,16 +232,38 @@ namespace MonoTorrent.Connections.Peer.Utp
             var remoteEp = MaterializeIPEndPoint (remote);
             UtpConnection? conn;
             lock (_lock) {
-                if (!_connections.TryGetValue ((remoteEp, header.ConnectionId), out conn)) {
-                    // Fallback: endpoint equality can fail if compact->IPEndPoint normalization differs
-                    // (e.g. port 0 vs announced port). Scan live sockets for matching conn id + compatible remote.
+                _connections.TryGetValue ((remoteEp, header.ConnectionId), out conn);
+                if (conn == null) {
+                    // Fallback: endpoint equality / keying can miss when CompactEndPoint normalization differs
+                    // (port 0, IPv4-mapped IPv6, loopback aliasing, etc.). Match on conn id + port, then address.
+                    UtpConnection? portMatch = null;
+                    UtpConnection? idOnlyMatch = null;
+                    int idMatches = 0;
                     foreach (var c in _liveConnections) {
-                        if ((c.RecvId == header.ConnectionId || c.SendId == header.ConnectionId) &&
-                            c.RemoteEndPoint.Port == remoteEp.Port &&
-                            c.RemoteEndPoint.Address.Equals (remoteEp.Address)) {
+                        if (c.RecvId != header.ConnectionId && c.SendId != header.ConnectionId)
+                            continue;
+                        idMatches++;
+                        idOnlyMatch = c;
+                        if (c.RemoteEndPoint.Port != remoteEp.Port && remoteEp.Port != 0 && c.RemoteEndPoint.Port != 0)
+                            continue;
+                        if (c.RemoteEndPoint.Address.Equals (remoteEp.Address) ||
+                            IsLoopbackCompatible (c.RemoteEndPoint.Address, remoteEp.Address)) {
                             conn = c;
                             break;
                         }
+                        portMatch ??= c;
+                    }
+                    conn ??= portMatch;
+                    // Unique conn-id match is sufficient when only one socket owns this id.
+                    if (conn == null && idMatches == 1)
+                        conn = idOnlyMatch;
+                    if (conn != null) {
+                        // Repair keys for future fast-path lookups (both canonical and observed endpoints).
+                        _connections[(conn.RemoteEndPoint, conn.RecvId)] = conn;
+                        _connections[(conn.RemoteEndPoint, conn.SendId)] = conn;
+                        _connections[(remoteEp, header.ConnectionId)] = conn;
+                        _connections[(remoteEp, conn.RecvId)] = conn;
+                        _connections[(remoteEp, conn.SendId)] = conn;
                     }
                 }
             }
@@ -360,6 +382,18 @@ namespace MonoTorrent.Connections.Peer.Utp
             }
 
             return new IPEndPoint (IPAddress.Any, 0);
+        }
+
+        static bool IsLoopbackCompatible (IPAddress a, IPAddress b)
+        {
+            if (a == null || b == null)
+                return false;
+            if (a.Equals (b))
+                return true;
+            // Treat IPv4/IPv6 loopback forms as compatible for local unit-test wiring.
+            bool aLoop = IPAddress.IsLoopback (a) || a.Equals (IPAddress.IPv6Loopback);
+            bool bLoop = IPAddress.IsLoopback (b) || b.Equals (IPAddress.IPv6Loopback);
+            return aLoop && bLoop;
         }
 
         void OnTick (object? state)
