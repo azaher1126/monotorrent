@@ -216,11 +216,12 @@ namespace MonoTorrent.Connections.Peer.Utp
             if (buffer.Length < UtpConstants.HeaderSize)
                 return;
 
+            // BEP 29 wire layout: high nibble = packet type (0..4), low nibble = version (always 1).
             byte typeVer = buffer.Span[0];
-            if ((typeVer >> 4) != UtpConstants.Version)
+            if ((typeVer & 0x0F) != UtpConstants.Version)
                 return; // Not uTP v1
 
-            UtpPacketType pktType = (UtpPacketType) (typeVer & 0x0F);
+            UtpPacketType pktType = (UtpPacketType) (typeVer >> 4);
             if ((byte) pktType > 4)
                 return;
 
@@ -231,7 +232,18 @@ namespace MonoTorrent.Connections.Peer.Utp
             var remoteEp = MaterializeIPEndPoint (remote);
             UtpConnection? conn;
             lock (_lock) {
-                _connections.TryGetValue ((remoteEp, header.ConnectionId), out conn);
+                if (!_connections.TryGetValue ((remoteEp, header.ConnectionId), out conn)) {
+                    // Fallback: endpoint equality can fail if compact->IPEndPoint normalization differs
+                    // (e.g. port 0 vs announced port). Scan live sockets for matching conn id + compatible remote.
+                    foreach (var c in _liveConnections) {
+                        if ((c.RecvId == header.ConnectionId || c.SendId == header.ConnectionId) &&
+                            c.RemoteEndPoint.Port == remoteEp.Port &&
+                            c.RemoteEndPoint.Address.Equals (remoteEp.Address)) {
+                            conn = c;
+                            break;
+                        }
+                    }
+                }
             }
 
             if (conn == null) {
@@ -309,16 +321,23 @@ namespace MonoTorrent.Connections.Peer.Utp
 
         void SendOnBestTransport (ReadOnlyMemory<byte> buffer, CompactEndPoint destination)
         {
-            // Choose a transport. For production we can keep per-AF transports when adding them.
-            // For the skeleton we just use the first (most engines have 1-2 and will work for the common case).
-            var best = _transports.Count > 0 ? _transports[0] : null;
+            // Prefer a transport whose local address family matches the destination endpoint.
+            ISocketMessageListener? best = null;
+            lock (_lock) {
+                if (_transports.Count == 0)
+                    return;
 
-            if (best == null) {
-                // uTP Send attempted with no attached transports — no transport available.
-                return;
+                var destEp = MaterializeIPEndPoint (destination);
+                foreach (var t in _transports) {
+                    if (t.LocalEndPoint != null && t.LocalEndPoint.AddressFamily == destEp.AddressFamily) {
+                        best = t;
+                        break;
+                    }
+                }
+                best ??= _transports[0];
             }
 
-            _ = best.SendAsync (buffer, destination); // fire-and-forget; errors are swallowed inside SendAsync of the listener
+            _ = best.SendAsync (buffer, destination); // fire-and-forget; UDP errors surface as missing acks / RTO
         }
 
         static IPEndPoint MaterializeIPEndPoint (CompactEndPoint ep)

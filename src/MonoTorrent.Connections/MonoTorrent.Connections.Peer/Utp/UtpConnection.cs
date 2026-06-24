@@ -260,7 +260,10 @@ namespace MonoTorrent.Connections.Peer.Utp
             var buf = fullDatagram.Span;
             if (buf.Length < UtpConstants.HeaderSize) return;
             if (ph.Version != UtpConstants.Version) return;
-            if (ph.PacketType != UtpPacketType.ST_SYN && ph.ConnectionId != RecvId) return;
+            // Peer replies use our SendId as connection_id (echo of the id in our SYN); incoming
+            // traffic targeted at this socket may also use RecvId depending on direction/role.
+            if (ph.PacketType != UtpPacketType.ST_SYN && ph.ConnectionId != RecvId && ph.ConnectionId != SendId)
+                return;
             if ((byte)ph.PacketType >= 5) return;
             if (_state != UtpState.None && ph.PacketType == UtpPacketType.ST_SYN) return;
 
@@ -279,10 +282,34 @@ namespace MonoTorrent.Connections.Peer.Utp
                 if (prev != 0 && ch < 0 && ch > -10000 && _delayHist.Initialized) _delayHist.AdjustBase(-ch);
             }
 
+            // --- Handshake first (must run before strict ack-window checks, which reject legitimate SYN/STATE) ---
+            // Passive open: accept SYN, set ack cursor, become Connected; caller sends immediate STATE.
+            if (_state == UtpState.None && ph.PacketType == UtpPacketType.ST_SYN) {
+                _ackNr = ph.SeqNr;
+                _ackedSeqNr = (ushort) ((ph.AckNr) & UtpConstants.AckMask);
+                _confirmed = true;
+                SetState (UtpState.Connected);
+            }
+            // Active open: peer STATE/DATA/FIN completes the three-way handshake.
+            else if (_state == UtpState.SynSent &&
+                     (ph.PacketType == UtpPacketType.ST_STATE || ph.PacketType == UtpPacketType.ST_DATA || ph.PacketType == UtpPacketType.ST_FIN)) {
+                _ackNr = ph.SeqNr;
+                // Advance our acked cursor to include the SYN we sent (peer should ack it in AckNr).
+                if (CompareLessWrap (_ackedSeqNr, ph.AckNr, UtpConstants.AckMask) || _ackedSeqNr == ph.AckNr)
+                    _ackedSeqNr = ph.AckNr;
+                _confirmed = true;
+                SetState (UtpState.Connected);
+            }
+
             bool sof = ph.PacketType == UtpPacketType.ST_STATE || ph.PacketType == UtpPacketType.ST_FIN;
             ushort cmp = ((_state == UtpState.SynSent || _state == UtpState.FinSent || _state == UtpState.Deleting) && sof) ? _seqNr : (ushort)((_seqNr - 1) & UtpConstants.AckMask);
 
-            if ((_state != UtpState.None || ph.PacketType != UtpPacketType.ST_SYN) && (CompareLessWrap(cmp, ph.AckNr, UtpConstants.AckMask) || CompareLessWrap(ph.AckNr, (ushort)(_ackedSeqNr - 3), UtpConstants.AckMask))) return;
+            // Skip strict ack validation only while still in pre-connected states for SYN (already handled above).
+            bool skipAckCheck = (_state == UtpState.Connected && ph.PacketType == UtpPacketType.ST_SYN) ||
+                                (ph.PacketType == UtpPacketType.ST_SYN && _isIncoming);
+            if (!skipAckCheck && (_state != UtpState.None || ph.PacketType != UtpPacketType.ST_SYN) &&
+                (CompareLessWrap(cmp, ph.AckNr, UtpConstants.AckMask) || CompareLessWrap(ph.AckNr, (ushort)(_ackedSeqNr - 3), UtpConstants.AckMask)))
+                return;
 
             if (_inEof && CompareLessWrap(_inEofSeqNr, ph.SeqNr, UtpConstants.AckMask) && !(_inEofSeqNr == ph.SeqNr && sof)) return;
 
@@ -398,6 +425,11 @@ namespace MonoTorrent.Connections.Peer.Utp
 
             bool na = ph.PacketType == UtpPacketType.ST_DATA || ph.PacketType == UtpPacketType.ST_FIN || ph.PacketType == UtpPacketType.ST_SYN;
             if (na || psz > 0) DeferAck();
+            // Always send an immediate STATE in response to SYN so the initiator completes the handshake promptly.
+            if (ph.PacketType == UtpPacketType.ST_SYN && _state == UtpState.Connected) {
+                _deferredAck = false;
+                SendStatePacket ();
+            }
 
             PumpSendQueue();
 
@@ -506,9 +538,9 @@ namespace MonoTorrent.Connections.Peer.Utp
             if (_state != UtpState.Connected && _state != UtpState.FinSent) return;
             if (d.Length == 0) return;
 
-            // Basic Nagle: hold small writes to coalesce (production to reduce overhead, like libtorrent)
+            // Basic Nagle: hold small writes only when data is already in-flight (avoids delaying the first write).
             const int nagleSize = 1400;
-            if (d.Length < 500 && _naglePacket != null && _naglePacket.PayloadSize + d.Length < nagleSize)
+            if (d.Length < 500 && _bytesInFlight > 0 && _naglePacket != null && _naglePacket.PayloadSize + d.Length < nagleSize)
             {
                 // append to current nagle packet
                 var combined = new byte[_naglePacket.Data.Length + d.Length];

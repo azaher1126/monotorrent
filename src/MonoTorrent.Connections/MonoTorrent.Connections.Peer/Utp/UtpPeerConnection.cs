@@ -2,20 +2,13 @@
 // UtpPeerConnection.cs
 //
 // IPeerConnection implementation backed by a uTP (BEP 29) stream.
-// This allows the entire MonoTorrent connection/encryption/handshake/message
-// machinery (ConnectionManager, ListenManager, EncryptorFactory, NetworkIO, PeerIO, etc.)
-// to treat uTP connections exactly like TCP SocketPeerConnection instances.
-//
-// Production notes:
-// - Delegates Connect/Receive/Send/Dispose to the underlying UtpConnection (the protocol state machine).
-// - Uri uses a "utp-ipv4" or "utp-ipv6" scheme so it is distinguishable in logs and for any future policy.
-// - CanReconnect is false for incoming uTP (same as TCP incoming), true for outgoing.
-// - The actual reliable ordered byte stream, congestion control, retransmits, etc. are all handled by UtpConnection + UtpSocketManager.
-//
+// Follows Microsoft dispose-pattern guidance (idempotent Dispose, ObjectDisposedException
+// on members after dispose): https://learn.microsoft.com/dotnet/standard/design-guidelines/dispose-pattern
 //
 
 using System;
 using System.Net;
+using System.Threading;
 
 using MonoTorrent.Connections.Peer;
 using ReusableTasks;
@@ -25,12 +18,13 @@ namespace MonoTorrent.Connections.Peer.Utp
     public sealed class UtpPeerConnection : IPeerConnection
     {
         readonly UtpConnection _impl;
+        int _disposed;
 
         public ReadOnlyMemory<byte> AddressBytes { get; }
 
         public bool CanReconnect { get; }
 
-        public bool Disposed { get; private set; }
+        public bool Disposed => Volatile.Read (ref _disposed) == 1;
 
         public IPEndPoint? EndPoint { get; }
 
@@ -52,8 +46,9 @@ namespace MonoTorrent.Connections.Peer.Utp
 
         public ReusableTask<bool> ConnectAsync ()
         {
-            // For uTP, the low-level SYN was already sent (outgoing) or we are reacting to an incoming SYN
-            // by the time the UtpPeerConnection wrapper is created.
+            ThrowIfDisposed ();
+
+            // SYN is already in flight (outgoing) or the peer initiated (incoming) when this wrapper is created.
             if (_impl.State == UtpState.Connected)
                 return ReusableTask.FromResult (true);
 
@@ -61,54 +56,64 @@ namespace MonoTorrent.Connections.Peer.Utp
                 return ReusableTask.FromResult (false);
 
             var tcs = new ReusableTaskCompletionSource<bool> ();
+            var completed = 0;
 
-            void OnConnected (UtpConnection c)
+            void Complete (bool success)
             {
+                if (Interlocked.Exchange (ref completed, 1) != 0)
+                    return;
                 _impl.Connected -= OnConnected;
-                tcs.SetResult (true);
+                tcs.SetResult (success);
             }
+
+            void OnConnected (UtpConnection _)
+                => Complete (true);
 
             _impl.Connected += OnConnected;
 
-            // If the state machine advanced between the check above and the subscription, fire immediately.
+            // Race: connection may have completed between the checks above and subscription.
             if (_impl.State == UtpState.Connected) {
-                _impl.Connected -= OnConnected;
-                tcs.SetResult (true);
+                Complete (true);
+            } else if (_impl.HasError || _impl.State == UtpState.ErrorWait || _impl.State == UtpState.Deleting) {
+                Complete (false);
             }
 
-            // Also monitor for error to fault the TCS (production).
-            // For simplicity, if error sets later, the receive/send will fail.
-            // Production note: could subscribe to error or poll in a task, but for now upper layers will see on I/O.
-
-            // Production note: a real implementation should also monitor for error states on the UtpConnection
-            // and cancel/ fault the TCS, plus apply an overall connection timeout.
             return tcs.Task;
         }
 
         public ReusableTask<int> ReceiveAsync (Memory<byte> buffer)
         {
-            if (Disposed)
-                throw new ObjectDisposedException (nameof (UtpPeerConnection));
-
+            ThrowIfDisposed ();
             return _impl.ReceiveAsync (buffer);
         }
 
         public ReusableTask<int> SendAsync (ReadOnlyMemory<byte> buffer)
         {
-            if (Disposed)
-                throw new ObjectDisposedException (nameof (UtpPeerConnection));
-
+            ThrowIfDisposed ();
             return _impl.SendAsync (buffer);
         }
 
         public void Dispose ()
         {
-            if (Disposed)
+            // Idempotent Dispose (Microsoft dispose pattern: safe to call more than once; do not throw).
+            if (Interlocked.Exchange (ref _disposed, 1) == 1)
                 return;
 
-            Disposed = true;
-            _impl.Abort(); // or CloseWrite for graceful, but Abort for immediate cleanup in dispose
-            // The manager will clean up on terminal state.
+            try {
+                if (_impl.State == UtpState.Connected || _impl.State == UtpState.FinSent)
+                    _impl.CloseWrite ();
+                else
+                    _impl.Abort ();
+            } catch {
+                // Dispose must not throw (design guidelines).
+                try { _impl.Abort (); } catch { /* ignored */ }
+            }
+        }
+
+        void ThrowIfDisposed ()
+        {
+            if (Disposed)
+                throw new ObjectDisposedException (nameof (UtpPeerConnection));
         }
     }
 }
