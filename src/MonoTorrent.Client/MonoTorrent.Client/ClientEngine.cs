@@ -225,6 +225,14 @@ namespace MonoTorrent.Client
 
         IDhtListener DhtListener { get; set; }
 
+        /// <summary>
+        /// The shared UDP transport (UdpTransport) used for both DHT and uTP (when enabled).
+        /// This guarantees only one UDP port is required.
+        /// </summary>
+        internal Connections.UdpTransport? UdpTransport { get; private set; }
+
+        internal Connections.Utp.UtpManager? UtpManager { get; private set; }
+
         public DiskManager DiskManager { get; }
 
         public bool Disposed { get; private set; }
@@ -334,22 +342,68 @@ namespace MonoTorrent.Client
                 uploadLimiter
             };
 
-            PeerListeners = Array.AsReadOnly (settings.ListenEndPoints.Values.Select (t => Factories.CreatePeerConnectionListener (t)).ToArray ());
-            listenManager.SetListeners (PeerListeners);
+            var peerListenerList = settings.ListenEndPoints.Values
+                .Select(t => Factories.CreatePeerConnectionListener(t))
+                .ToList();
 
-            DhtListener = (settings.DhtEndPoint == null ? null : Factories.CreateDhtListener (settings.DhtEndPoint)) ?? new NullDhtListener ();
-            var engine = (settings.DhtEndPoint == null ? null : Factories.CreateDht ()) ?? new NullDhtEngine ();
-            engine.SetBootstrapRoutersAsync (settings.DhtBootstrapRouters).AsTask ().GetAwaiter ().GetResult ();
+            if (Settings.UtpEnabled)
+            {
+                // Choose an endpoint for the shared UDP transport (peer listen port preferred so that
+                // the announced port works for both TCP and uTP + DHT).
+                var preferredEp = settings.ListenEndPoints.Values.FirstOrDefault()
+                                  ?? settings.DhtEndPoint
+                                  ?? new IPEndPoint(IPAddress.Any, 0);
 
-            DhtEngine = new DhtEngineWrapper (engine);
-            DhtEngine.SetListenerAsync (DhtListener).AsTask ().GetAwaiter ().GetResult ();
+                UdpTransport = new Connections.UdpTransport(preferredEp);
+                UtpManager = new Connections.Utp.UtpManager(
+                    UdpTransport,
+                    targetDelayMs: Settings.UtpTargetDelayMilliseconds,
+                    gainFactor: Settings.UtpGainFactor,
+                    receiveWindow: Settings.UtpReceiveWindow,
+                    maxPacketSize: Settings.UtpMaxPacketSize,
+                    synResends: Settings.UtpSynResends,
+                    finResends: Settings.UtpFinResends,
+                    numResends: Settings.UtpNumResends,
+                    logEnabled: Settings.UtpLog,
+                    tickInterval: Settings.UtpTickInterval,
+                    allowDynamicMtu: Settings.UtpAllowDynamicMtu
+                );
+
+                // Share the single UDP socket/transport with DHT. Non-uTP packets are delivered
+                // via the normal MessageReceived path.
+                DhtListener = (Connections.Dht.IDhtListener)UdpTransport;
+
+                // Start the transport (the socket is bound here).
+                UdpTransport.StartTransport(CancellationToken.None);
+
+                // Register the uTP listener so that incoming uTP connections are fed into the
+                // exact same ListenManager / encryption / handshake path as TCP connections.
+                var utpListener = new Connections.Peer.UtpPeerConnectionListener(UtpManager, preferredEp);
+                peerListenerList.Add(utpListener);
+            }
+            else
+            {
+                DhtListener = (settings.DhtEndPoint == null ? null : Factories.CreateDhtListener(settings.DhtEndPoint)) ?? new NullDhtListener();
+            }
+
+            PeerListeners = peerListenerList.AsReadOnly();
+            listenManager.SetListeners(PeerListeners);
+
+            var dhtEngine = (settings.DhtEndPoint == null ? null : Factories.CreateDht()) ?? new NullDhtEngine();
+            dhtEngine.SetBootstrapRoutersAsync(settings.DhtBootstrapRouters).AsTask().GetAwaiter().GetResult();
+
+            DhtEngine = new DhtEngineWrapper(dhtEngine);
+            DhtEngine.SetListenerAsync(DhtListener).AsTask().GetAwaiter().GetResult();
+
+            // Give ConnectionManager access to the UtpManager so it can prefer uTP for outgoing connections.
+            ConnectionManager.UtpManager = UtpManager;
 
             DhtEngine.PeersFound += DhtEnginePeersFound;
-            LocalPeerDiscovery = new NullLocalPeerDiscovery ();
+            LocalPeerDiscovery = new NullLocalPeerDiscovery();
 
             TrackerAnnounceLimiter = new ReusableSemaphore (15);
 
-            RegisterLocalPeerDiscovery (settings.AllowLocalPeerDiscovery ? Factories.CreateLocalPeerDiscovery () : null);
+            RegisterLocalPeerDiscovery(settings.AllowLocalPeerDiscovery ? Factories.CreateLocalPeerDiscovery() : null);
         }
 
         #endregion

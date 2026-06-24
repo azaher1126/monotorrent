@@ -69,6 +69,8 @@ namespace MonoTorrent.Client
 
         internal PeerInfo Info { get; private set; }
 
+        internal bool SupportsUtp { get; set; }
+
         /// <summary>
         /// The number of times, in a row, that this peer has sent us the blocks for a piece and that
         /// piece failed the hash check.
@@ -89,6 +91,7 @@ namespace MonoTorrent.Client
         public Peer (PeerInfo peerInfo)
         {
             Info = peerInfo ?? throw new ArgumentNullException (nameof (peerInfo));
+            SupportsUtp = peerInfo.SupportsUtp;
         }
 
         public override bool Equals (object? obj)

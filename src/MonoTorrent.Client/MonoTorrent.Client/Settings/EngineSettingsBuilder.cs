@@ -164,6 +164,32 @@ namespace MonoTorrent.Client
         public IPEndPoint? DhtEndPoint { get; set; }
 
         /// <summary>
+        /// Enables uTP (micro Transport Protocol, BEP29) for peer connections. When true, the engine will
+        /// attempt uTP first for outgoing connections (with TCP fallback) and accept incoming uTP connections
+        /// on the shared UDP transport. Defaults to true.
+        /// </summary>
+        public bool UtpEnabled { get; set; } = true;
+
+        /// <summary>
+        /// The target one-way queuing delay (in milliseconds) used by uTP's LEDBAT congestion controller.
+        /// Defaults to 75.
+        /// </summary>
+        public int UtpTargetDelayMilliseconds { get; set; } = 75;
+
+        public double UtpGainFactor { get; set; } = 1.0;
+        public int UtpMinTimeout { get; set; } = 500;
+        public int UtpInitialTimeout { get; set; } = 1000;
+        public int UtpSynResends { get; set; } = 2;
+        public int UtpFinResends { get; set; } = 2;
+        public int UtpNumResends { get; set; } = 3;
+        public int UtpConnectTimeout { get; set; } = 30000;
+        public int UtpMaxPacketSize { get; set; } = 1500;
+        public bool UtpAllowDynamicMtu { get; set; } = true;
+        public int UtpReceiveWindow { get; set; } = 1024 * 1024;
+        public bool UtpLog { get; set; } = false;
+        public TimeSpan UtpTickInterval { get; set; } = TimeSpan.FromMilliseconds(50);
+
+        /// <summary>
         /// When <see cref="EngineSettings.AutoSaveLoadFastResume"/> is true, this setting is used to control how fast
         /// resume data is maintained, otherwise it has no effect. You can prioritise accuracy (at the risk of requiring full hash checks if an actively downloading
         /// torrent does not cleanly enter the <see cref="TorrentState.Stopped"/> state) by choosing <see cref="FastResumeMode.Accurate"/>.
@@ -344,6 +370,20 @@ namespace MonoTorrent.Client
             DhtBootstrapRouters = new List<BootstrapRouter> (settings.DhtBootstrapRouters);
             DhtEndPoint = settings.DhtEndPoint;
             DiskCacheBytes = settings.DiskCacheBytes;
+            UtpEnabled = settings.UtpEnabled;
+            UtpTargetDelayMilliseconds = settings.UtpTargetDelayMilliseconds;
+            UtpGainFactor = settings.UtpGainFactor;
+            UtpMinTimeout = settings.UtpMinTimeout;
+            UtpInitialTimeout = settings.UtpInitialTimeout;
+            UtpSynResends = settings.UtpSynResends;
+            UtpFinResends = settings.UtpFinResends;
+            UtpNumResends = settings.UtpNumResends;
+            UtpConnectTimeout = settings.UtpConnectTimeout;
+            UtpMaxPacketSize = settings.UtpMaxPacketSize;
+            UtpAllowDynamicMtu = settings.UtpAllowDynamicMtu;
+            UtpReceiveWindow = settings.UtpReceiveWindow;
+            UtpLog = settings.UtpLog;
+            UtpTickInterval = settings.UtpTickInterval;
             DiskCachePolicy = settings.DiskCachePolicy;
             FastResumeMode = settings.FastResumeMode;
             FileCreationMode = settings.FileCreationOptions;
@@ -401,7 +441,7 @@ namespace MonoTorrent.Client
                 cacheDirectory: string.IsNullOrEmpty (CacheDirectory) ? Environment.CurrentDirectory : Path.GetFullPath (CacheDirectory),
                 connectionRetryDelays: ConnectionRetryDelays,
                 connectionTimeouts: ConnectionTimeouts,
-                dhtBootstrapRouters : DhtBootstrapRouters,
+                dhtBootstrapRouters: DhtBootstrapRouters,
                 dhtEndPoint: DhtEndPoint,
                 diskCacheBytes: DiskCacheBytes,
                 diskCachePolicy: DiskCachePolicy,
@@ -417,11 +457,25 @@ namespace MonoTorrent.Client
                 maximumOpenFiles: MaximumOpenFiles,
                 maximumUploadRate: MaximumUploadRate,
                 reportedListenEndPoints: ReportedListenEndPoints,
-                staleRequestTimeout: StaleRequestTimeout,
                 usePartialFiles: UsePartialFiles,
                 webSeedConnectionTimeout: WebSeedConnectionTimeout,
                 webSeedDelay: WebSeedDelay,
-                webSeedSpeedTrigger: webSeedSpeedTrigger
+                webSeedSpeedTrigger: WebSeedSpeedTrigger,
+                staleRequestTimeout: StaleRequestTimeout,
+                utpEnabled: UtpEnabled,
+                utpTargetDelayMilliseconds: UtpTargetDelayMilliseconds,
+                utpGainFactor: UtpGainFactor,
+                utpMinTimeout: UtpMinTimeout,
+                utpInitialTimeout: UtpInitialTimeout,
+                utpSynResends: UtpSynResends,
+                utpFinResends: UtpFinResends,
+                utpNumResends: UtpNumResends,
+                utpConnectTimeout: UtpConnectTimeout,
+                utpMaxPacketSize: UtpMaxPacketSize,
+                utpAllowDynamicMtu: UtpAllowDynamicMtu,
+                utpReceiveWindow: UtpReceiveWindow,
+                utpLog: UtpLog,
+                utpTickInterval: UtpTickInterval
             );
         }
 

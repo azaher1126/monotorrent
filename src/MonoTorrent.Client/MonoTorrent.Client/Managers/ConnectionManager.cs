@@ -32,6 +32,8 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
+using System.Net;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -114,6 +116,11 @@ namespace MonoTorrent.Client
         internal EngineSettings Settings { get; set; }
         internal List<TorrentManager> Torrents { get; set; }
 
+        /// <summary>
+        /// When non-null, the engine prefers uTP for outgoing connections (with TCP fallback on failure).
+        /// </summary>
+        internal Connections.Utp.UtpManager? UtpManager { get; set; }
+
         internal ConnectionManager (BEncodedString localPeerId, EngineSettings settings, Factories factories, DiskManager diskManager)
         {
             DiskManager = diskManager ?? throw new ArgumentNullException (nameof (diskManager));
@@ -178,10 +185,38 @@ namespace MonoTorrent.Client
                 if (!manager.Mode.CanAcceptConnections)
                     return ConnectionFailureReason.Unknown;
 
-                // Create a new IPeerConnection object for each connection attempt.
-                var connection = Factories.CreatePeerConnection (peer.Info.ConnectionUri);
+                // uTP-first preference (per plan and review feedback): always attempt uTP first when the manager
+                // is available, then fall back to TCP if the uTP connection cannot be established or the full
+                // handshake/encryption over uTP fails.
+                IPeerConnection? connection = null;
+                if (UtpManager != null)
+                {
+                    try
+                    {
+                        var host = peer.Info.ConnectionUri.Host;
+                        var port = peer.Info.ConnectionUri.Port;
+                        var address = IPAddress.TryParse(host, out var ip) ? ip : Dns.GetHostEntry(host).AddressList.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork || a.AddressFamily == AddressFamily.InterNetworkV6);
+                        if (address != null)
+                        {
+                            var ep = new CompactEndPoint(address, port);
+                            var utpSocket = UtpManager.CreateOutgoing(ep);
+                            connection = new UtpPeerConnection(utpSocket, isIncoming: false);
+                            peer.SupportsUtp = true;
+                        }
+                    }
+                    catch
+                    {
+                        // uTP attempt failed to even create the socket (e.g. bad endpoint). Fall through to TCP.
+                        connection = null;
+                    }
+                }
+
                 if (connection == null)
-                    return ConnectionFailureReason.UnknownUriSchema;
+                {
+                    connection = Factories.CreatePeerConnection(peer.Info.ConnectionUri);
+                    if (connection == null)
+                        return ConnectionFailureReason.UnknownUriSchema;
+                }
 
                 var timeout = Settings.ConnectionTimeouts[Math.Min (Settings.ConnectionTimeouts.Count - 1, peer.FailedConnectionAttempts)];
                 var state = new AsyncConnectState (manager, connection, timeout, ValueStopwatch.StartNew ());

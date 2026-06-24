@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0</TargetFrameworks>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>UtpTestClient</AssemblyName>
+    <RootNamespace>UtpTestClient</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\MonoTorrent\MonoTorrent.csproj" />
+    <ProjectReference Include="..\..\MonoTorrent.BEncoding\MonoTorrent.BEncoding.csproj" />
+    <ProjectReference Include="..\..\MonoTorrent.Client\MonoTorrent.Client.csproj" />
+    <ProjectReference Include="..\..\MonoTorrent.Connections\MonoTorrent.Connections.csproj" />
+    <ProjectReference Include="..\..\MonoTorrent.Factories\MonoTorrent.Factories.csproj" />
+    <ProjectReference Include="..\..\MonoTorrent.Trackers\MonoTorrent.Trackers.csproj" />
+  </ItemGroup>
+
+</Project>
